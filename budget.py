@@ -668,6 +668,18 @@ with tabs[0]:
             status = 'ok'
             if solde is not None and solde < -od: status = 'danger'
             elif (proj is not None and proj < -od) or (solde is not None and solde < (-od+300)): status = 'warn'
+            # Encours MC affiché uniquement sur CA
+            mc_encours_html = ""
+            if cpt_id == 'ca':
+                mc_encours = sum(t['montant'] for t in D['tx']
+                                 if t['compte'] == 'mc' and t['type'] == 'depense'
+                                 and aff_key(t) == (now.year, now.month - 1))
+                mc_color = COMPTES['mc']['color']
+                mc_encours_html = f"""<hr style="border:none;border-top:1px solid #e0e0e0;margin:8px 0">
+                <small style="color:#888">Encours Mastercard ce mois</small><br>
+                <span style="font-size:16px;font-weight:600;color:{mc_color}">−{fmt2(mc_encours)}</span>
+                <small style="color:#888"> (prélevé le 1er du mois prochain)</small><br>"""
+
             st.markdown(f"""
             <div class="metric-card today-{status}">
                 <strong style="font-size:14px">{cpt['label']}</strong><br>
@@ -676,7 +688,8 @@ with tabs[0]:
                 <small style="color:#888">Solde au {now.day}/{now.month:02d}</small><br>
                 <span style="font-size:22px;font-weight:700;color:{'#E24B4A' if (solde or 0)<0 else '#1D9E75'}">{fmt2(solde)}</span><br>
                 <small style="color:#888">{'→ ' + fmt2(proj) + ' après prélèvements' if up else 'Aucun prélèvement en attente'}</small><br>
-                <small style="color:#888">Découvert autorisé : {fmt2(-od)}</small>
+                <small style="color:#888">Découvert autorisé : {fmt2(-od)}</small><br>
+                {mc_encours_html}
             </div>""", unsafe_allow_html=True)
 
     st.markdown("---")

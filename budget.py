@@ -540,7 +540,7 @@ with tabs[0]:
 with tabs[1]:
     st.subheader(f"{MOIS[M]} {Y}")
     sol_cols = st.columns(2)
-    for i, (cpt_id, cpt) in [(k,v) for k,v in COMPTES.items() if k != 'mc']:
+    for i, (cpt_id, cpt) in enumerate((k,v) for k,v in COMPTES.items() if k != 'mc'):
         with sol_cols[i]:
             deb = get_sol(cpt_id, M, Y)
             tx_m = tx_of_month(M, Y)

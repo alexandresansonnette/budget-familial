@@ -1,5 +1,6 @@
 """
 Budget Familial AS — Application Streamlit
+Stockage : Google Sheets (persistant entre sessions)
 Comptes : Crédit Agricole (CA) · Mastercard débit différé (MC) · Monabanq (MB)
 """
 
@@ -7,12 +8,11 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import json
-import os
+import gspread
+from google.oauth2.service_account import Credentials
 from datetime import datetime, date
-from pathlib import Path
 from collections import defaultdict
 
-# ── Config page ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Budget Familial",
     page_icon="💰",
@@ -23,112 +23,139 @@ st.set_page_config(
 # ── Constantes ─────────────────────────────────────────────────────────────────
 MOIS = ['Janvier','Février','Mars','Avril','Mai','Juin',
         'Juillet','Août','Septembre','Octobre','Novembre','Décembre']
+MOIS_COURT = ['Jan','Fév','Mar','Avr','Mai','Jun','Jul','Aoû','Sep','Oct','Nov','Déc']
 COMPTES = {
-    'ca':  {'label':'Crédit Agricole', 'color':'#378ADD', 'bg':'#E6F1FB', 'tc':'#0C447C'},
-    'mc':  {'label':'Mastercard',      'color':'#BA7517', 'bg':'#FAEEDA', 'tc':'#633806'},
-    'mb':  {'label':'Monabanq',        'color':'#1D9E75', 'bg':'#E1F5EE', 'tc':'#085041'},
+    'ca': {'label':'Crédit Agricole','color':'#378ADD','bg':'#E6F1FB','tc':'#0C447C'},
+    'mc': {'label':'Mastercard',     'color':'#BA7517','bg':'#FAEEDA','tc':'#633806'},
+    'mb': {'label':'Monabanq',       'color':'#1D9E75','bg':'#E1F5EE','tc':'#085041'},
 }
-CATS_DEFAULT = [
+CATS_DEFAULT = sorted([
     'ARE / Salaire','Allocations','Revenu freelance','Prêt / Assurance',
     'Frais divers','Nourriture','Habit / Beauté','Santé','Sénégal',
     'CLAE / École','Loisirs / Vacances','Voiture','Abonnement','Tontine',
     'Épargne','Virement interne','Impôts / Taxes','Divers'
-]
-DATA_FILE = Path("data/budget_data.json")
+])
 CC = ['#378ADD','#1D9E75','#D85A30','#D4537E','#7F77DD',
       '#639922','#BA7517','#E24B4A','#888780','#0F6E56']
+GSHEET_NAME = "Budget Familial AS"
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets',
+          'https://www.googleapis.com/auth/drive']
 
 # ── Helpers format ──────────────────────────────────────────────────────────────
 def fmt(n):
     if n is None: return "—"
-    return f"{n:,.0f} €".replace(",", " ")
+    return f"{n:,.0f} €".replace(",", "\u202f")
 
 def fmt2(n):
     if n is None: return "—"
-    return f"{n:,.2f} €".replace(",", " ")
+    return f"{n:,.2f} €".replace(",", "\u202f")
 
 def aff_key(t):
-    """Clé mois d'affectation d'une transaction (gestion MC débit différé)."""
     if t.get('compte') == 'mc' and t.get('affM') is not None and t.get('affY') is not None:
         return (int(t['affY']), int(t['affM']))
     d = datetime.strptime(t['date'], '%Y-%m-%d')
-    return (d.year, d.month - 1)  # 0-indexed month
+    return (d.year, d.month - 1)
 
 def month_add(m, y, n):
-    """Ajoute n mois à (m, y), retourne (new_m, new_y). m est 0-indexed."""
     total = y * 12 + m + n
     return total % 12, total // 12
 
-# ── Stockage données ────────────────────────────────────────────────────────────
-def load_data():
-    """Charge les données depuis le fichier JSON local."""
-    if DATA_FILE.exists():
+# ── Google Sheets ───────────────────────────────────────────────────────────────
+@st.cache_resource
+def get_gsheet_client():
+    """Connexion au Google Sheet via les secrets Streamlit."""
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    return gspread.authorize(creds)
+
+def load_from_gsheet():
+    """Charge toutes les données depuis Google Sheets (onglet 'data')."""
+    try:
+        client = get_gsheet_client()
+        sh = client.open(GSHEET_NAME)
+        ws = sh.worksheet("data")
+        val = ws.acell('A1').value
+        if val:
+            return json.loads(val)
+    except Exception as e:
+        st.warning(f"Impossible de charger depuis Google Sheets : {e}")
+    return get_default_data()
+
+def save_to_gsheet(data):
+    """Sauvegarde toutes les données dans Google Sheets (cellule A1 de l'onglet 'data')."""
+    try:
+        client = get_gsheet_client()
+        sh = client.open(GSHEET_NAME)
         try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            pass
+            ws = sh.worksheet("data")
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title="data", rows=1, cols=1)
+        ws.update('A1', json.dumps(data, ensure_ascii=False))
+    except Exception as e:
+        st.error(f"Erreur de sauvegarde : {e}")
+
+def get_default_data():
     return {
-        'tx': [], 'cats': CATS_DEFAULT,
-        'prets': [], 'rec': [], 'sol': {},
+        'tx': [], 
+        'cats': [{'nom': c, 'visible': True} for c in CATS_DEFAULT],
+        'prets': [], 
+        'rec': [], 
+        'sol': {},
         'overdraft': {'ca': 500, 'mc': 0, 'mb': 250}
     }
 
-def save_data(data):
-    """Sauvegarde les données dans le fichier JSON local."""
-    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
 # ── Session state ───────────────────────────────────────────────────────────────
 if 'data' not in st.session_state:
-    st.session_state.data = load_data()
+    st.session_state.data = load_from_gsheet()
 if 'cur_m' not in st.session_state:
-    st.session_state.cur_m = datetime.now().month - 1  # 0-indexed
+    st.session_state.cur_m = datetime.now().month - 1
 if 'cur_y' not in st.session_state:
     st.session_state.cur_y = datetime.now().year
 if 'fcpt' not in st.session_state:
     st.session_state.fcpt = 'all'
-if 'edit_tx' not in st.session_state:
-    st.session_state.edit_tx = None
 
-D = st.session_state.data  # raccourci
+D = st.session_state.data
+
+# Migration : si cats est une liste de strings, convertir
+if D['cats'] and isinstance(D['cats'][0], str):
+    D['cats'] = [{'nom': c, 'visible': True} for c in D['cats']]
 
 def persist():
-    save_data(st.session_state.data)
+    save_to_gsheet(st.session_state.data)
+
+def visible_cats():
+    """Retourne les catégories visibles, triées alphabétiquement."""
+    return sorted([c['nom'] for c in D['cats'] if c.get('visible', True)])
+
+def all_cats():
+    return sorted([c['nom'] for c in D['cats']])
 
 # ── Calculs ─────────────────────────────────────────────────────────────────────
 def tx_of_month(m, y, tx=None):
-    if tx is None:
-        tx = D['tx']
+    if tx is None: tx = D['tx']
     return [t for t in tx if aff_key(t) == (y, m)]
 
 def rec_applied(rid, m, y):
     return any(t.get('recId') == rid and aff_key(t) == (y, m) for t in D['tx'])
 
 def get_sol(c, m, y):
-    k = f"{c}_{y}_{m}"
-    v = D['sol'].get(k)
+    v = D['sol'].get(f"{c}_{y}_{m}")
     return float(v) if v is not None else None
 
 def set_sol(c, m, y, v):
     k = f"{c}_{y}_{m}"
-    if v is not None:
-        D['sol'][k] = v
-    else:
-        D['sol'].pop(k, None)
+    if v is not None: D['sol'][k] = v
+    else: D['sol'].pop(k, None)
 
 def solde_a_date(cpt_id):
     now = datetime.now()
     m, y = now.month - 1, now.year
     deb = get_sol(cpt_id, m, y)
-    if deb is None:
-        return None
+    if deb is None: return None
     txs = [t for t in D['tx'] if t['compte'] == cpt_id
            and aff_key(t) == (y, m)
            and datetime.strptime(t['date'], '%Y-%m-%d') <= now]
-    mvt = sum(t['montant'] if t['type'] == 'revenu' else -t['montant'] for t in txs)
-    return deb + mvt
+    return deb + sum(t['montant'] if t['type']=='revenu' else -t['montant'] for t in txs)
 
 def upcoming_rec(cpt_id):
     now = datetime.now()
@@ -142,9 +169,8 @@ def upcoming_rec(cpt_id):
 def get_alerts(cpt_id):
     od = D['overdraft'].get(cpt_id, 0)
     solde = solde_a_date(cpt_id)
+    if solde is None: return []
     alerts = []
-    if solde is None:
-        return []
     if solde < -od:
         alerts.append(('danger', f"Solde dans le rouge : {fmt2(solde)}"))
     elif solde < (-od + 300):
@@ -154,179 +180,152 @@ def get_alerts(cpt_id):
         prev = proj
         proj += r['mnt'] if r['type'] == 'revenu' else -r['mnt']
         if proj < -od and prev >= -od:
-            alerts.append(('warn', f"« {r['nom']} » ({fmt2(r['mnt'])}) le {r['jour']} → solde prévu {fmt2(proj)}"))
+            alerts.append(('warn', f"« {r['nom']} » ({fmt2(r['mnt'])}) le {r['jour']} → {fmt2(proj)}"))
     return alerts
 
-def month_net_actual(cpt_id, m, y):
-    return sum(
-        t['montant'] if t['type'] == 'revenu' else -t['montant']
-        for t in tx_of_month(m, y)
-        if t['compte'] == cpt_id
-    )
-
-def avg_non_rec(cpt_id):
+def month_net(cpt_id, m, y, forecast=False):
+    if not forecast:
+        return sum(t['montant'] if t['type']=='revenu' else -t['montant']
+                   for t in tx_of_month(m, y) if t['compte'] == cpt_id)
+    rec_n = sum(r['mnt'] if r['type']=='revenu' else -r['mnt']
+                for r in D['rec'] if r['compte'] == cpt_id)
+    past = []
     now = datetime.now()
     cm, cy = now.month - 1, now.year
-    totals = []
     for i in range(1, 7):
         pm, py = month_add(cm, cy, -i)
         txs = [t for t in tx_of_month(pm, py) if t['compte'] == cpt_id and not t.get('recId')]
         if txs:
-            totals.append(sum(t['montant'] if t['type'] == 'revenu' else -t['montant'] for t in txs))
-    return sum(totals) / len(totals) if totals else 0
-
-def rec_net(cpt_id):
-    return sum(r['mnt'] if r['type'] == 'revenu' else -r['mnt'] for r in D['rec'] if r['compte'] == cpt_id)
+            past.append(sum(t['montant'] if t['type']=='revenu' else -t['montant'] for t in txs))
+    return rec_n + (sum(past)/len(past) if past else 0)
 
 def build_forecast():
-    """Construit les séries de solde prévisionnel sur 12 mois glissants."""
+    """
+    Prévisionnel 12 mois glissants.
+    MC : affiché comme débit sur CA le 1er du mois suivant (pas comme compte séparé).
+    """
     now = datetime.now()
     cm, cy = now.month - 1, now.year
-    months = [month_add(cm, cy, i) for i in range(-6, 6)]  # (m, y) tuples
+    months = [month_add(cm, cy, i) for i in range(-6, 6)]
     series = {}
-    for cpt_id in COMPTES:
+
+    for cpt_id in ['ca', 'mb']:  # MC exclus du prévisionnel
         base = get_sol(cpt_id, cm, cy) or 0
         nets = []
         for i, (m, y) in enumerate(months):
             rel = i - 6
             if rel < 0:
-                nets.append(month_net_actual(cpt_id, m, y))
+                n = month_net(cpt_id, m, y)
             elif rel == 0:
-                actual = month_net_actual(cpt_id, m, y)
-                proj = sum(
-                    r['mnt'] if r['type'] == 'revenu' else -r['mnt']
-                    for r in D['rec']
-                    if r['compte'] == cpt_id and r['jour'] > now.day and not rec_applied(r['id'], m, y)
-                )
-                nets.append(actual + proj)
+                actual = month_net(cpt_id, m, y)
+                proj = sum(r['mnt'] if r['type']=='revenu' else -r['mnt']
+                           for r in D['rec'] if r['compte'] == cpt_id
+                           and r['jour'] > now.day
+                           and not rec_applied(r['id'], m, y))
+                n = actual + proj
             else:
-                nets.append(rec_net(cpt_id) + avg_non_rec(cpt_id))
+                n = month_net(cpt_id, m, y, forecast=True)
+
+            # Pour CA : ajouter le débit MC du mois précédent (prélèvement en début de mois)
+            if cpt_id == 'ca':
+                prev_m, prev_y = month_add(m, y, -1)
+                mc_debit = sum(t['montant'] for t in tx_of_month(prev_m, prev_y)
+                               if t['compte'] == 'mc' and t['type'] == 'depense')
+                if rel > 0:
+                    mc_debit_fc = sum(r['mnt'] for r in D['rec'] if r['compte'] == 'mc' and r['type'] == 'depense')
+                    mc_debit = mc_debit_fc + month_net('mc', prev_m, prev_y, True) * (-1)
+                    mc_debit = max(0, mc_debit)
+                n -= mc_debit
+
+            nets.append(n)
+
         opens = [0.0] * 12
         opens[6] = base
-        for i in range(7, 12):
-            opens[i] = opens[i-1] + nets[i-1]
-        for j in range(4, -1, -1):
-            opens[j] = opens[j+1] - nets[j]
-        closes = [opens[i] + nets[i] for i in range(12)]
-        series[cpt_id] = {'opens': opens, 'closes': closes, 'nets': nets}
+        for i in range(7, 12): opens[i] = opens[i-1] + nets[i-1]
+        for j in range(4, -1, -1): opens[j] = opens[j+1] - nets[j]
+        series[cpt_id] = {'closes': [opens[i] + nets[i] for i in range(12)]}
+
     return months, series
 
-# ── CSS custom ──────────────────────────────────────────────────────────────────
+# ── CSS ─────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 .main > div { padding-top: 1rem; }
-.stTabs [data-baseweb="tab-list"] { gap: 4px; }
-.stTabs [data-baseweb="tab"] { padding: 8px 16px; font-size: 13px; }
-.metric-card {
-    background: var(--background-color);
-    border: 1px solid #e0e0e0;
-    border-radius: 10px;
-    padding: 14px 16px;
-    margin-bottom: 8px;
-}
-.today-ok { border-left: 4px solid #1D9E75; }
-.today-warn { border-left: 4px solid #D97706; }
+.metric-card { border: 1px solid #e0e0e0; border-radius: 10px; padding: 14px 16px; margin-bottom: 8px; }
+.today-ok     { border-left: 4px solid #1D9E75; }
+.today-warn   { border-left: 4px solid #D97706; }
 .today-danger { border-left: 4px solid #E24B4A; }
-.alert-danger { background: #fdf0f0; border-left: 4px solid #E24B4A; padding: 10px 14px; border-radius: 6px; margin-bottom: 8px; color: #791F1F; font-size: 13px; }
-.alert-warn { background: #fff8e6; border-left: 4px solid #D97706; padding: 10px 14px; border-radius: 6px; margin-bottom: 8px; color: #7C4A00; font-size: 13px; }
-.alert-ok { background: #f0faf4; border-left: 4px solid #1D9E75; padding: 10px 14px; border-radius: 6px; margin-bottom: 8px; color: #085041; font-size: 13px; }
-div[data-testid="stMetric"] { background: #f8f9fa; border-radius: 8px; padding: 10px 14px; }
+.alert-danger { background:#fdf0f0; border-left:4px solid #E24B4A; padding:10px 14px; border-radius:6px; margin-bottom:8px; color:#791F1F; font-size:13px; }
+.alert-warn   { background:#fff8e6; border-left:4px solid #D97706; padding:10px 14px; border-radius:6px; margin-bottom:8px; color:#7C4A00; font-size:13px; }
+.alert-ok     { background:#f0faf4; border-left:4px solid #1D9E75; padding:10px 14px; border-radius:6px; margin-bottom:8px; color:#085041; font-size:13px; }
 </style>
 """, unsafe_allow_html=True)
 
 # ── NAVIGATION ──────────────────────────────────────────────────────────────────
-col_nav1, col_nav2, col_nav3, col_nav4, col_nav5 = st.columns([1,2,1,3,2])
-with col_nav1:
+nc1, nc2, nc3, nc4, nc5 = st.columns([1, 2, 1, 2, 2])
+with nc1:
     if st.button("◀", use_container_width=True):
-        if st.session_state.cur_m == 0:
-            st.session_state.cur_m = 11
-            st.session_state.cur_y -= 1
-        else:
-            st.session_state.cur_m -= 1
+        if st.session_state.cur_m == 0: st.session_state.cur_m = 11; st.session_state.cur_y -= 1
+        else: st.session_state.cur_m -= 1
         st.rerun()
-with col_nav2:
-    m_options = list(range(12))
-    new_m = st.selectbox("", m_options, index=st.session_state.cur_m,
-                         format_func=lambda x: MOIS[x], label_visibility='collapsed')
-    if new_m != st.session_state.cur_m:
-        st.session_state.cur_m = new_m
-        st.rerun()
-with col_nav3:
+with nc2:
+    nm = st.selectbox("", range(12), index=st.session_state.cur_m,
+                      format_func=lambda x: MOIS[x], label_visibility='collapsed')
+    if nm != st.session_state.cur_m: st.session_state.cur_m = nm; st.rerun()
+with nc3:
     if st.button("▶", use_container_width=True):
-        if st.session_state.cur_m == 11:
-            st.session_state.cur_m = 0
-            st.session_state.cur_y += 1
-        else:
-            st.session_state.cur_m += 1
+        if st.session_state.cur_m == 11: st.session_state.cur_m = 0; st.session_state.cur_y += 1
+        else: st.session_state.cur_m += 1
         st.rerun()
-with col_nav4:
-    new_y = st.selectbox("", list(range(2023, 2031)), index=list(range(2023, 2031)).index(st.session_state.cur_y),
-                         label_visibility='collapsed')
-    if new_y != st.session_state.cur_y:
-        st.session_state.cur_y = new_y
-        st.rerun()
-with col_nav5:
-    fcpt_opts = {'all': 'Tous les comptes', **{k: v['label'] for k, v in COMPTES.items()}}
-    new_fcpt = st.selectbox("", list(fcpt_opts.keys()), format_func=lambda x: fcpt_opts[x], label_visibility='collapsed')
-    if new_fcpt != st.session_state.fcpt:
-        st.session_state.fcpt = new_fcpt
-        st.rerun()
+with nc4:
+    ny = st.selectbox("", range(2023, 2031), index=list(range(2023,2031)).index(st.session_state.cur_y),
+                      label_visibility='collapsed')
+    if ny != st.session_state.cur_y: st.session_state.cur_y = ny; st.rerun()
+with nc5:
+    fopts = {'all':'Tous les comptes', **{k: v['label'] for k,v in COMPTES.items()}}
+    nf = st.selectbox("", list(fopts.keys()), format_func=lambda x: fopts[x], label_visibility='collapsed')
+    if nf != st.session_state.fcpt: st.session_state.fcpt = nf; st.rerun()
 
-M, Y = st.session_state.cur_m, st.session_state.cur_y
-FCPT = st.session_state.fcpt
+M, Y, FCPT = st.session_state.cur_m, st.session_state.cur_y, st.session_state.fcpt
 TX_CUR = [t for t in tx_of_month(M, Y) if FCPT == 'all' or t['compte'] == FCPT]
 
 st.divider()
 
-# ── ONGLETS ─────────────────────────────────────────────────────────────────────
-tabs = st.tabs(["📍 Aujourd'hui", "📊 Mois", "📋 Transactions", "✏️ Saisie",
-                "🔄 Récurrentes", "📈 Prévisionnel", "🏦 Prêts",
-                "🏷️ Catégories", "💾 Sauvegarde"])
+tabs = st.tabs(["📍 Aujourd'hui","📊 Mois","📋 Transactions","✏️ Saisie",
+                "🔄 Récurrentes","📈 Prévisionnel","🏦 Prêts","🏷️ Catégories","💾 Sauvegarde"])
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ONGLET 1 — AUJOURD'HUI
+# AUJOURD'HUI
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[0]:
     now = datetime.now()
     st.subheader(f"Situation au {now.strftime('%d/%m/%Y')}")
 
-    # Cartes par compte
     cols = st.columns(3)
     for i, (cpt_id, cpt) in enumerate(COMPTES.items()):
         with cols[i]:
             solde = solde_a_date(cpt_id)
             od = D['overdraft'].get(cpt_id, 0)
             up = upcoming_rec(cpt_id)
-            up_net = sum(r['mnt'] if r['type'] == 'revenu' else -r['mnt'] for r in up)
+            up_net = sum(r['mnt'] if r['type']=='revenu' else -r['mnt'] for r in up)
             proj = solde + up_net if solde is not None else None
-            deb = get_sol(cpt_id, now.month - 1, now.year)
-
+            deb = get_sol(cpt_id, now.month-1, now.year)
             status = 'ok'
-            if solde is not None and solde < -od:
-                status = 'danger'
-            elif (proj is not None and proj < -od) or (solde is not None and solde < (-od + 300)):
-                status = 'warn'
-
-            css_class = f"metric-card today-{status}"
-            solde_str = fmt2(solde) if solde is not None else "—"
-            deb_str = fmt2(deb) if deb is not None else "Non renseigné"
-            proj_str = fmt2(proj) if proj is not None else "—"
-
+            if solde is not None and solde < -od: status = 'danger'
+            elif (proj is not None and proj < -od) or (solde is not None and solde < (-od+300)): status = 'warn'
             st.markdown(f"""
-            <div class="{css_class}">
+            <div class="metric-card today-{status}">
                 <strong style="font-size:14px">{cpt['label']}</strong><br>
                 <small style="color:#888">Solde début de mois</small><br>
-                <span style="font-size:13px">{deb_str}</span><br><br>
+                <span style="font-size:13px">{deb if deb is not None else 'Non renseigné'}</span><br><br>
                 <small style="color:#888">Solde au {now.day}/{now.month:02d}</small><br>
-                <span style="font-size:22px;font-weight:700;color:{'#E24B4A' if (solde or 0)<0 else '#1D9E75'}">{solde_str}</span><br>
+                <span style="font-size:22px;font-weight:700;color:{'#E24B4A' if (solde or 0)<0 else '#1D9E75'}">{fmt2(solde)}</span><br>
                 <small style="color:#888">{'→ ' + fmt2(proj) + ' après prélèvements' if up else 'Aucun prélèvement en attente'}</small><br>
                 <small style="color:#888">Découvert autorisé : {fmt2(-od)}</small>
-            </div>
-            """, unsafe_allow_html=True)
+            </div>""", unsafe_allow_html=True)
 
     st.markdown("---")
-    col_al, col_od = st.columns([2, 1])
-
+    col_al, col_od = st.columns([2,1])
     with col_al:
         st.markdown("**⚠️ Alertes & prélèvements à venir**")
         has_alert = False
@@ -334,479 +333,401 @@ with tabs[0]:
             for typ, msg in get_alerts(cpt_id):
                 has_alert = True
                 st.markdown(f'<div class="alert-{typ}"><strong>{cpt["label"]}</strong> — {msg}</div>', unsafe_allow_html=True)
-
         if not has_alert:
             st.markdown('<div class="alert-ok">✓ Tous les comptes sont en ordre.</div>', unsafe_allow_html=True)
-
-        # Prélèvements à venir ce mois
-        all_up = []
-        for cpt_id, cpt in COMPTES.items():
-            for r in upcoming_rec(cpt_id):
-                all_up.append({**r, 'cpt_label': cpt['label'], 'cpt_color': cpt['color']})
-        all_up.sort(key=lambda x: x['jour'])
-
+        all_up = sorted(
+            [{'r':r,'cpt':COMPTES[cpt_id]} for cpt_id in COMPTES for r in upcoming_rec(cpt_id)],
+            key=lambda x: x['r']['jour']
+        )
         if all_up:
-            st.markdown("**Prochains prélèvements ce mois :**")
-            df_up = pd.DataFrame([{
-                'Compte': r['cpt_label'],
-                'Nom': r['nom'],
-                'Le': r['jour'],
-                'Montant': f"{'−' if r['type']=='depense' else '+'}{fmt2(r['mnt'])}"
-            } for r in all_up])
-            st.dataframe(df_up, use_container_width=True, hide_index=True)
-
+            st.markdown("**Prochains prélèvements :**")
+            for x in all_up:
+                r, cpt = x['r'], x['cpt']
+                sign = '−' if r['type']=='depense' else '+'
+                st.write(f"• **{cpt['label'].split()[0]}** — {r['nom']} — le {r['jour']} — {sign}{fmt2(r['mnt'])}")
     with col_od:
         st.markdown("**Découverts autorisés**")
         for cpt_id, cpt in COMPTES.items():
-            new_od = st.number_input(cpt['label'], value=float(D['overdraft'].get(cpt_id, 0)),
+            new_od = st.number_input(cpt['label'], value=float(D['overdraft'].get(cpt_id,0)),
                                      step=50.0, key=f"od_{cpt_id}")
-            if new_od != D['overdraft'].get(cpt_id, 0):
-                D['overdraft'][cpt_id] = new_od
-                persist()
+            if new_od != D['overdraft'].get(cpt_id,0):
+                D['overdraft'][cpt_id] = new_od; persist()
 
-    # Dernières transactions du mois
     st.markdown("---")
     st.markdown("**Dernières transactions du mois**")
-    tx_today = sorted(tx_of_month(now.month - 1, now.year), key=lambda t: t['date'], reverse=True)[:8]
-    if tx_today:
-        df_today = pd.DataFrame([{
-            'Date': t['date'][8:] + '/' + t['date'][5:7],
+    tx_now = sorted(tx_of_month(now.month-1, now.year), key=lambda t: t['date'], reverse=True)[:8]
+    if tx_now:
+        st.dataframe(pd.DataFrame([{
+            'Date': datetime.strptime(t['date'],'%Y-%m-%d').strftime('%d/%m/%Y'),
             'Compte': COMPTES[t['compte']]['label'].split()[0],
             'Description': t.get('note') or t['categorie'],
-            'Catégorie': t['categorie'],
             'Montant': f"{'−' if t['type']=='depense' else '+'}{fmt2(t['montant'])}"
-        } for t in tx_today])
-        st.dataframe(df_today, use_container_width=True, hide_index=True)
+        } for t in tx_now]), use_container_width=True, hide_index=True)
     else:
         st.info("Aucune transaction ce mois.")
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# ONGLET 2 — MOIS
+# MOIS
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[1]:
     st.subheader(f"{MOIS[M]} {Y}")
-
-    # Soldes par compte
-    st.markdown("**Soldes**")
     sol_cols = st.columns(3)
     for i, (cpt_id, cpt) in enumerate(COMPTES.items()):
         with sol_cols[i]:
             deb = get_sol(cpt_id, M, Y)
             mvt = sum(t['montant'] if t['type']=='revenu' else -t['montant']
-                      for t in tx_of_month(M, Y) if t['compte'] == cpt_id)
-            fin = (deb + mvt) if deb is not None else None
+                      for t in tx_of_month(M,Y) if t['compte']==cpt_id)
+            fin = (deb+mvt) if deb is not None else None
             with st.expander(f"**{cpt['label']}**", expanded=True):
-                st.metric("Solde début", fmt2(deb) if deb is not None else "—")
-                st.metric("Mouvements", f"{'+' if mvt>=0 else ''}{fmt2(mvt)}", delta=None)
-                st.metric("Solde fin", fmt2(fin) if fin is not None else "—")
+                c1,c2,c3 = st.columns(3)
+                c1.metric("Début", fmt2(deb))
+                c2.metric("Mouvement", f"{'+' if mvt>=0 else ''}{fmt2(mvt)}")
+                c3.metric("Fin", fmt2(fin))
                 new_sol = st.number_input("Solde au 1er :", value=float(deb) if deb is not None else 0.0,
-                                          step=10.0, key=f"sol_{cpt_id}_{M}_{Y}")
-                if st.button("Enregistrer", key=f"sav_sol_{cpt_id}_{M}_{Y}"):
-                    set_sol(cpt_id, M, Y, new_sol)
-                    persist()
-                    st.success("✓")
-                    st.rerun()
+                                          step=10.0, key=f"sol_{cpt_id}_{M}_{Y}", format="%.2f")
+                if st.button("💾 Enregistrer", key=f"sav_{cpt_id}_{M}_{Y}"):
+                    set_sol(cpt_id, M, Y, new_sol); persist()
+                    st.success("✓"); st.rerun()
 
     st.divider()
-
-    # KPIs
-    rev = sum(t['montant'] for t in TX_CUR if t['type'] == 'revenu')
-    dep = sum(t['montant'] for t in TX_CUR if t['type'] == 'depense')
-    k1, k2, k3 = st.columns(3)
+    rev = sum(t['montant'] for t in TX_CUR if t['type']=='revenu')
+    dep = sum(t['montant'] for t in TX_CUR if t['type']=='depense')
+    k1,k2,k3 = st.columns(3)
     k1.metric("Revenus", fmt(rev))
     k2.metric("Dépenses", fmt(dep))
     k3.metric("Variation", f"{'+' if rev-dep>=0 else ''}{fmt(rev-dep)}")
-
     st.divider()
-
-    # Graphiques
-    g1, g2 = st.columns(2)
+    g1,g2 = st.columns(2)
     with g1:
-        st.markdown("**Dépenses par catégorie**")
-        dep_by_cat = defaultdict(float)
+        st.markdown("**Par catégorie**")
+        dbc = defaultdict(float)
         for t in TX_CUR:
-            if t['type'] == 'depense':
-                dep_by_cat[t['categorie']] += t['montant']
-        if dep_by_cat:
-            df_cat = pd.DataFrame(sorted(dep_by_cat.items(), key=lambda x: -x[1])[:8],
-                                  columns=['Catégorie', 'Montant'])
-            fig = go.Figure(go.Bar(
-                x=df_cat['Catégorie'], y=df_cat['Montant'],
-                marker_color=CC[:len(df_cat)],
-                text=[fmt(v) for v in df_cat['Montant']],
-                textposition='outside'
-            ))
-            fig.update_layout(height=300, margin=dict(t=20,b=80), showlegend=False,
-                              yaxis_title="€", xaxis_tickangle=-30)
+            if t['type']=='depense': dbc[t['categorie']] += t['montant']
+        if dbc:
+            df_c = pd.DataFrame(sorted(dbc.items(),key=lambda x:-x[1])[:8], columns=['Cat','Montant'])
+            fig = go.Figure(go.Bar(x=df_c['Cat'], y=df_c['Montant'], marker_color=CC[:len(df_c)],
+                                   text=[fmt(v) for v in df_c['Montant']], textposition='outside'))
+            fig.update_layout(height=300, margin=dict(t=20,b=80), showlegend=False, xaxis_tickangle=-30)
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("Aucune dépense ce mois.")
-
+            st.info("Aucune dépense.")
     with g2:
-        st.markdown("**Répartition par compte**")
-        dep_by_cpt = {cpt_id: sum(t['montant'] for t in TX_CUR if t['type']=='depense' and t['compte']==cpt_id)
-                      for cpt_id in COMPTES}
-        dep_by_cpt = {k: v for k, v in dep_by_cpt.items() if v > 0}
-        if dep_by_cpt:
+        st.markdown("**Par compte**")
+        dba = {c: sum(t['montant'] for t in TX_CUR if t['type']=='depense' and t['compte']==c) for c in COMPTES}
+        dba = {k:v for k,v in dba.items() if v>0}
+        if dba:
             fig2 = go.Figure(go.Pie(
-                labels=[COMPTES[k]['label'] for k in dep_by_cpt],
-                values=list(dep_by_cpt.values()),
-                marker_colors=[COMPTES[k]['color'] for k in dep_by_cpt],
-                hole=0.4
-            ))
+                labels=[COMPTES[k]['label'] for k in dba], values=list(dba.values()),
+                marker_colors=[COMPTES[k]['color'] for k in dba], hole=0.4))
             fig2.update_layout(height=300, margin=dict(t=20,b=20))
             st.plotly_chart(fig2, use_container_width=True)
         else:
-            st.info("Aucune dépense ce mois.")
-
+            st.info("Aucune dépense.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ONGLET 3 — TRANSACTIONS
+# TRANSACTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[2]:
     st.subheader(f"Transactions — {MOIS[M]} {Y}")
-
-    # Filtre catégorie
-    all_cats_cur = sorted(set(t['categorie'] for t in TX_CUR))
-    filt_cat = st.selectbox("Filtrer par catégorie", ['Toutes'] + all_cats_cur)
-    tx_show = TX_CUR if filt_cat == 'Toutes' else [t for t in TX_CUR if t['categorie'] == filt_cat]
-    tx_show = sorted(tx_show, key=lambda t: t['date'], reverse=True)
-
+    cats_filt = ['Toutes'] + sorted(set(t['categorie'] for t in TX_CUR))
+    filt_cat = st.selectbox("Filtrer par catégorie", cats_filt)
+    tx_show = sorted(
+        TX_CUR if filt_cat=='Toutes' else [t for t in TX_CUR if t['categorie']==filt_cat],
+        key=lambda t: t['date'], reverse=True
+    )
     if not tx_show:
         st.info("Aucune transaction.")
     else:
         for t in tx_show:
-            col_d, col_c, col_n, col_m, col_btn = st.columns([1, 1.2, 2, 1.2, 1])
-            d = datetime.strptime(t['date'], '%Y-%m-%d')
-            col_d.write(d.strftime('%d/%m'))
-            cpt = COMPTES.get(t['compte'], {'label': t['compte']})
-            mc_info = f" → {['Jan','Fév','Mar','Avr','Mai','Jun','Jul','Aoû','Sep','Oct','Nov','Déc'][int(t['affM'])]}" if t['compte'] == 'mc' and t.get('affM') is not None else ""
-            col_c.write(f"**{cpt['label'].split()[0]}**{mc_info}")
-            rec_icon = " ↺" if t.get('recId') else ""
-            col_n.write(f"{t.get('note') or t['categorie']}{rec_icon}")
-            color = "🔴" if t['type'] == 'depense' else "🟢"
-            sign = "−" if t['type'] == 'depense' else "+"
-            col_m.write(f"{color} {sign}{fmt2(t['montant'])}")
-            with col_btn:
-                if st.button("🗑", key=f"del_{t['id']}"):
-                    D['tx'] = [x for x in D['tx'] if x['id'] != t['id']]
-                    persist()
-                    st.rerun()
+            d = datetime.strptime(t['date'],'%Y-%m-%d')
+            cpt = COMPTES.get(t['compte'],{'label':t['compte']})
+            with st.expander(f"{'−' if t['type']=='depense' else '+'}{fmt2(t['montant'])} — {t.get('note') or t['categorie']} — {d.strftime('%d/%m/%Y')}", expanded=False):
+                with st.form(key=f"edit_tx_{t['id']}"):
+                    ef1,ef2 = st.columns(2)
+                    with ef1:
+                        new_date = st.date_input("Date", value=d.date(), key=f"td_{t['id']}")
+                        new_cpt = st.selectbox("Compte", list(COMPTES.keys()),
+                                               index=list(COMPTES.keys()).index(t['compte']),
+                                               format_func=lambda x: COMPTES[x]['label'],
+                                               key=f"tc_{t['id']}")
+                        new_type = st.radio("Type", ['depense','revenu'],
+                                            index=0 if t['type']=='depense' else 1,
+                                            format_func=lambda x: '💸 Dépense' if x=='depense' else '💰 Revenu',
+                                            horizontal=True, key=f"tt_{t['id']}")
+                    with ef2:
+                        new_cat = st.selectbox("Catégorie", visible_cats(),
+                                               index=visible_cats().index(t['categorie']) if t['categorie'] in visible_cats() else 0,
+                                               key=f"tcat_{t['id']}")
+                        new_mnt = st.number_input("Montant €", value=float(t['montant']),
+                                                  step=0.01, format="%.2f", key=f"tm_{t['id']}")
+                        new_note = st.text_input("Note", value=t.get('note',''), key=f"tn_{t['id']}")
 
+                    new_affm, new_affy = t.get('affM'), t.get('affY')
+                    if new_cpt == 'mc':
+                        mc1,mc2 = st.columns(2)
+                        new_affm = mc1.selectbox("Mois affectation", range(12),
+                                                 index=int(t['affM']) if t.get('affM') is not None else d.month-1,
+                                                 format_func=lambda x: MOIS[x], key=f"tam_{t['id']}")
+                        new_affy = mc2.selectbox("Année", [2024,2025,2026,2027],
+                                                 index=[2024,2025,2026,2027].index(int(t['affY'])) if t.get('affY') in [2024,2025,2026,2027] else 2,
+                                                 key=f"tay_{t['id']}")
+
+                    col_save, col_del = st.columns([3,1])
+                    if col_save.form_submit_button("💾 Enregistrer", use_container_width=True):
+                        idx = next(i for i,x in enumerate(D['tx']) if x['id']==t['id'])
+                        D['tx'][idx] = {**t, 'date': new_date.strftime('%Y-%m-%d'),
+                                        'compte': new_cpt, 'categorie': new_cat,
+                                        'montant': float(new_mnt), 'type': new_type,
+                                        'note': new_note, 'affM': new_affm, 'affY': new_affy}
+                        persist(); st.success("✓"); st.rerun()
+                if st.button("🗑 Supprimer", key=f"del_tx_{t['id']}"):
+                    D['tx'] = [x for x in D['tx'] if x['id']!=t['id']]
+                    persist(); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ONGLET 4 — SAISIE
+# SAISIE
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[3]:
     st.subheader("Ajouter une transaction")
-    with st.form("add_tx_form", clear_on_submit=True):
-        fc1, fc2 = st.columns(2)
+    with st.form("add_tx", clear_on_submit=True):
+        fc1,fc2 = st.columns(2)
         with fc1:
-            tx_date = st.date_input("Date", value=date.today())
-            tx_cpt = st.selectbox("Compte", list(COMPTES.keys()),
-                                  format_func=lambda x: COMPTES[x]['label'])
-            tx_type = st.radio("Type", ['depense', 'revenu'],
-                               format_func=lambda x: '💸 Dépense' if x == 'depense' else '💰 Revenu',
+            tx_date = st.date_input("Date (JJ/MM/AAAA)", value=date.today(), format="DD/MM/YYYY")
+            tx_cpt = st.selectbox("Compte", list(COMPTES.keys()), format_func=lambda x: COMPTES[x]['label'])
+            tx_type = st.radio("Type", ['depense','revenu'],
+                               format_func=lambda x: '💸 Dépense' if x=='depense' else '💰 Revenu',
                                horizontal=True)
         with fc2:
-            tx_cat = st.selectbox("Catégorie", D['cats'])
+            tx_cat = st.selectbox("Catégorie", visible_cats())
             tx_mnt = st.number_input("Montant (€)", min_value=0.01, step=0.01, format="%.2f")
-            tx_note = st.text_input("Note (optionnel)", placeholder="Description libre…")
-
-        # Mastercard : mois d'affectation
-        aff_m, aff_y = None, None
+            tx_note = st.text_input("Note", placeholder="Description…")
+        aff_m = aff_y = None
         if tx_cpt == 'mc':
-            st.info("💳 **Mastercard débit différé** — Le mois d'affectation peut différer de la date réelle.")
-            mc1, mc2 = st.columns(2)
-            with mc1:
-                aff_m = st.selectbox("Mois d'affectation", range(12), index=datetime.now().month - 1,
-                                     format_func=lambda x: MOIS[x])
-            with mc2:
-                aff_y = st.selectbox("Année", [2024, 2025, 2026, 2027], index=2)
-
-        submitted = st.form_submit_button("✅ Ajouter la transaction", type="primary", use_container_width=True)
-        if submitted:
-            if tx_mnt <= 0:
-                st.error("Le montant doit être supérieur à 0.")
-            else:
-                new_tx = {
-                    'id': f"tx_{int(datetime.now().timestamp()*1000)}",
-                    'date': tx_date.strftime('%Y-%m-%d'),
-                    'compte': tx_cpt,
-                    'categorie': tx_cat,
-                    'montant': float(tx_mnt),
-                    'type': tx_type,
-                    'note': tx_note
-                }
-                if tx_cpt == 'mc' and aff_m is not None:
-                    new_tx['affM'] = aff_m
-                    new_tx['affY'] = aff_y
-                D['tx'].append(new_tx)
-                persist()
-                st.success(f"✓ Transaction ajoutée : {fmt2(tx_mnt)} — {tx_cat}")
-                st.rerun()
-
+            st.info("💳 **Mastercard débit différé** — mois d'affectation :")
+            m1,m2 = st.columns(2)
+            aff_m = m1.selectbox("Mois", range(12), index=datetime.now().month-1, format_func=lambda x: MOIS[x])
+            aff_y = m2.selectbox("Année", [2024,2025,2026,2027], index=2)
+        if st.form_submit_button("✅ Ajouter", type="primary", use_container_width=True):
+            new_tx = {'id':f"tx_{int(datetime.now().timestamp()*1000)}",
+                      'date':tx_date.strftime('%Y-%m-%d'), 'compte':tx_cpt,
+                      'categorie':tx_cat, 'montant':float(tx_mnt),
+                      'type':tx_type, 'note':tx_note}
+            if tx_cpt=='mc' and aff_m is not None:
+                new_tx['affM'] = aff_m; new_tx['affY'] = aff_y
+            D['tx'].append(new_tx); persist()
+            st.success(f"✓ {fmt2(tx_mnt)} — {tx_cat}"); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ONGLET 5 — RÉCURRENTES
+# RÉCURRENTES
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[4]:
-    st.subheader(f"Charges récurrentes — {MOIS[M]} {Y}")
-
-    applied_count = sum(1 for r in D['rec'] if rec_applied(r['id'], M, Y))
-    st.info(f"**{applied_count} / {len(D['rec'])}** charges appliquées ce mois.")
-
-    if st.button("⚡ Appliquer toutes les récurrentes au mois en cours", type="primary"):
+    st.subheader(f"Récurrentes — {MOIS[M]} {Y}")
+    applied = sum(1 for r in D['rec'] if rec_applied(r['id'],M,Y))
+    st.info(f"**{applied} / {len(D['rec'])}** charges appliquées ce mois.")
+    if st.button("⚡ Appliquer toutes au mois en cours", type="primary"):
         added = 0
         for r in D['rec']:
-            if rec_applied(r['id'], M, Y):
-                continue
-            j = min(r['jour'], 28)
-            ds = f"{Y}-{M+1:02d}-{j:02d}"
-            D['tx'].append({
-                'id': f"tx_{int(datetime.now().timestamp()*1000)}_{added}",
-                'date': ds, 'compte': r['compte'], 'categorie': r['cat'],
-                'montant': r['mnt'], 'type': r['type'], 'note': r['nom'], 'recId': r['id']
-            })
+            if rec_applied(r['id'],M,Y): continue
+            j = min(r['jour'],28)
+            D['tx'].append({'id':f"tx_{int(datetime.now().timestamp()*1000)}_{added}",
+                            'date':f"{Y}-{M+1:02d}-{j:02d}", 'compte':r['compte'],
+                            'categorie':r['cat'], 'montant':r['mnt'],
+                            'type':r['type'], 'note':r['nom'], 'recId':r['id']})
             added += 1
-        persist()
-        st.success(f"✓ {added} charge(s) appliquée(s) pour {MOIS[M]} {Y}.")
-        st.rerun()
+        persist(); st.success(f"✓ {added} appliquée(s)."); st.rerun()
 
     st.divider()
-
-    # Liste des récurrentes
-    if D['rec']:
-        for r in D['rec']:
-            done = rec_applied(r['id'], M, Y)
-            icon = "✅" if done else "⏳"
-            cpt = COMPTES.get(r['compte'], {'label': r['compte']})
-            sign = "−" if r['type'] == 'depense' else "+"
-            rc1, rc2, rc3, rc4, rc5, rc6 = st.columns([2, 1.2, 1.5, 1, 0.8, 0.6])
-            rc1.write(f"{icon} **{r['nom']}** (j.{r['jour']})")
-            rc2.write(cpt['label'].split()[0])
-            rc3.write(r['cat'])
-            rc4.write(f"{sign}{fmt2(r['mnt'])}")
-            rc5.write("✓" if done else "—")
-            with rc6:
-                if st.button("🗑", key=f"del_rec_{r['id']}"):
-                    D['rec'] = [x for x in D['rec'] if x['id'] != r['id']]
-                    persist()
-                    st.rerun()
-    else:
-        st.info("Aucune charge récurrente enregistrée. Restaure ton JSON de sauvegarde.")
+    for r in D['rec']:
+        done = rec_applied(r['id'],M,Y)
+        icon = "✅" if done else "⏳"
+        cpt = COMPTES.get(r['compte'],{'label':r['compte']})
+        with st.expander(f"{icon} **{r['nom']}** — {'+' if r['type']=='revenu' else '−'}{fmt2(r['mnt'])} — {cpt['label'].split()[0]} — j.{r['jour']}"):
+            with st.form(f"edit_rec_{r['id']}"):
+                er1,er2 = st.columns(2)
+                with er1:
+                    rn = st.text_input("Nom", value=r['nom'])
+                    rc = st.selectbox("Compte", list(COMPTES.keys()),
+                                      index=list(COMPTES.keys()).index(r['compte']),
+                                      format_func=lambda x: COMPTES[x]['label'])
+                    rt = st.radio("Type", ['depense','revenu'],
+                                  index=0 if r['type']=='depense' else 1,
+                                  format_func=lambda x: '💸 Dépense' if x=='depense' else '💰 Revenu',
+                                  horizontal=True, key=f"rtype_{r['id']}")
+                with er2:
+                    rcat = st.selectbox("Catégorie", visible_cats(),
+                                        index=visible_cats().index(r['cat']) if r['cat'] in visible_cats() else 0)
+                    rmnt = st.number_input("Montant €", value=float(r['mnt']), step=0.01, format="%.2f")
+                    rjour = st.number_input("Jour du mois", value=int(r['jour']), min_value=1, max_value=28)
+                if st.form_submit_button("💾 Enregistrer", use_container_width=True):
+                    idx = next(i for i,x in enumerate(D['rec']) if x['id']==r['id'])
+                    D['rec'][idx] = {**r,'nom':rn,'compte':rc,'cat':rcat,'mnt':float(rmnt),'type':rt,'jour':int(rjour)}
+                    persist(); st.success("✓"); st.rerun()
+            if st.button("🗑 Supprimer", key=f"del_r_{r['id']}"):
+                D['rec'] = [x for x in D['rec'] if x['id']!=r['id']]
+                persist(); st.rerun()
 
     st.divider()
     st.markdown("**Ajouter une charge récurrente**")
-    with st.form("add_rec_form", clear_on_submit=True):
-        ar1, ar2 = st.columns(2)
+    with st.form("add_rec", clear_on_submit=True):
+        ar1,ar2 = st.columns(2)
         with ar1:
-            r_nom = st.text_input("Nom", placeholder="Loyer, SFR, Netflix…")
-            r_cpt = st.selectbox("Compte", list(COMPTES.keys()), format_func=lambda x: COMPTES[x]['label'])
-            r_type = st.radio("Type", ['depense', 'revenu'],
-                              format_func=lambda x: '💸 Dépense' if x == 'depense' else '💰 Revenu',
-                              horizontal=True, key="rtype")
+            rn2 = st.text_input("Nom")
+            rc2 = st.selectbox("Compte", list(COMPTES.keys()), format_func=lambda x: COMPTES[x]['label'], key="arc")
+            rt2 = st.radio("Type", ['depense','revenu'],
+                           format_func=lambda x: '💸 Dépense' if x=='depense' else '💰 Revenu',
+                           horizontal=True, key="art")
         with ar2:
-            r_cat = st.selectbox("Catégorie", D['cats'], key="rcat")
-            r_mnt = st.number_input("Montant (€)", min_value=0.01, step=0.01, format="%.2f", key="rmnt")
-            r_jour = st.number_input("Jour du mois", min_value=1, max_value=28, value=5)
+            rcat2 = st.selectbox("Catégorie", visible_cats(), key="arcat")
+            rmnt2 = st.number_input("Montant €", min_value=0.01, step=0.01, format="%.2f", key="armnt")
+            rjour2 = st.number_input("Jour du mois", min_value=1, max_value=28, value=5, key="arjour")
         if st.form_submit_button("✅ Enregistrer", use_container_width=True):
-            D['rec'].append({
-                'id': f"r_{int(datetime.now().timestamp()*1000)}",
-                'nom': r_nom, 'compte': r_cpt, 'cat': r_cat,
-                'mnt': float(r_mnt), 'type': r_type, 'jour': int(r_jour)
-            })
-            persist()
-            st.success("✓ Charge enregistrée !")
-            st.rerun()
-
+            D['rec'].append({'id':f"r_{int(datetime.now().timestamp()*1000)}",'nom':rn2,
+                             'compte':rc2,'cat':rcat2,'mnt':float(rmnt2),'type':rt2,'jour':int(rjour2)})
+            persist(); st.success("✓"); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ONGLET 6 — PRÉVISIONNEL
+# PRÉVISIONNEL
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[5]:
-    st.subheader("Prévisionnel 12 mois glissants")
-    st.caption("Trait plein = réel · Pointillé = prévisionnel (récurrentes + moyenne) · Ligne tiretée = limite découvert")
-
+    st.subheader("Prévisionnel 12 mois — CA & Monabanq")
+    st.caption("MC exclue (avance de trésorerie soldée en début de mois suivant sur CA) · Pointillé = prévisionnel")
     months, series = build_forecast()
-    month_labels = [f"{'~' if i>6 else ''}{['Jan','Fév','Mar','Avr','Mai','Jun','Jul','Aoû','Sep','Oct','Nov','Déc'][m]}\n{y}" for i,(m,y) in enumerate(months)]
-
+    labels = [f"{'~' if i>6 else ''}{MOIS_COURT[m]} {y}" for i,(m,y) in enumerate(months)]
     fig = go.Figure()
-
-    # Zone rouge (négatif)
-    y_min_all = min(min(s['closes']) for s in series.values())
-    fig.add_hrect(y0=y_min_all * 1.1, y1=0, fillcolor="rgba(220,50,50,0.05)", line_width=0)
-
-    for cpt_id, cpt in COMPTES.items():
+    fig.add_hrect(y0=min(min(s['closes']) for s in series.values())*1.1, y1=0,
+                  fillcolor="rgba(220,50,50,0.05)", line_width=0)
+    for cpt_id, cpt in {k:v for k,v in COMPTES.items() if k!='mc'}.items():
         closes = series[cpt_id]['closes']
-        now_idx = 6
-
-        # Ligne passé (pleine)
-        fig.add_trace(go.Scatter(
-            x=month_labels[:now_idx+1], y=closes[:now_idx+1],
-            mode='lines+markers', name=cpt['label'],
-            line=dict(color=cpt['color'], width=2),
-            marker=dict(size=6, color=[
-                '#E24B4A' if (cpt_id != 'mc' and v < -(D['overdraft'].get(cpt_id, 0))) else cpt['color']
-                for v in closes[:now_idx+1]
-            ]),
-            fill='tozeroy', fillcolor=f"rgba({int(cpt['color'][1:3],16)},{int(cpt['color'][3:5],16)},{int(cpt['color'][5:7],16)},0.05)"
-        ))
-        # Ligne futur (pointillée)
-        if now_idx < 11:
-            fig.add_trace(go.Scatter(
-                x=month_labels[now_idx:], y=closes[now_idx:],
-                mode='lines+markers', showlegend=False,
-                line=dict(color=cpt['color'], width=1.5, dash='dot'),
-                marker=dict(size=5, color=cpt['color'])
-            ))
-        # Ligne découvert
-        od_val = D['overdraft'].get(cpt_id, 0)
-        if od_val > 0 and cpt_id != 'mc':
+        fig.add_trace(go.Scatter(x=labels[:7], y=closes[:7], mode='lines+markers',
+                                 name=cpt['label'], line=dict(color=cpt['color'],width=2),
+                                 fill='tozeroy', fillcolor=f"rgba({int(cpt['color'][1:3],16)},{int(cpt['color'][3:5],16)},{int(cpt['color'][5:7],16)},0.05)"))
+        fig.add_trace(go.Scatter(x=labels[6:], y=closes[6:], mode='lines+markers',
+                                 showlegend=False, line=dict(color=cpt['color'],width=1.5,dash='dot')))
+        od_val = D['overdraft'].get(cpt_id,0)
+        if od_val>0:
             fig.add_hline(y=-od_val, line_dash="dash", line_color=cpt['color'],
                           line_width=1, opacity=0.4,
-                          annotation_text=f"-{od_val}€", annotation_position="right")
-
-    # Ligne Aujourd'hui
-    fig.add_vline(x=month_labels[6], line_dash="dot", line_color="gray", line_width=1.5)
-    fig.add_annotation(x=month_labels[6], y=1, yref="paper", text="Aujourd'hui",
-                       showarrow=False, font=dict(size=10, color="gray"), yanchor="bottom")
-
-    fig.update_layout(
-        height=400, hovermode='x unified',
-        margin=dict(t=40, b=60, l=60, r=20),
-        legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
-        yaxis_title="Solde (€)", xaxis_title=""
-    )
+                          annotation_text=f"Découvert {cpt['label'].split()[0]}", annotation_position="right")
+    fig.add_vline(x=labels[6], line_dash="dot", line_color="gray", line_width=1.5)
+    fig.update_layout(height=400, hovermode='x unified', margin=dict(t=40,b=60,l=60,r=20),
+                      legend=dict(orientation="h",yanchor="bottom",y=-0.25,xanchor="center",x=0.5),
+                      yaxis_title="Solde (€)")
     st.plotly_chart(fig, use_container_width=True)
-
-    # Tableau récap
-    st.markdown("**Tableau récapitulatif**")
     df_fc = pd.DataFrame(
-        {cpt['label'].split()[0]: [f"{'~' if i>6 else ''}{round(series[cpt_id]['closes'][i])}" for i in range(12)]
-         for cpt_id, cpt in COMPTES.items()},
-        index=month_labels
+        {COMPTES[c]['label'].split()[0]: [f"{'~' if i>6 else ''}{round(series[c]['closes'][i])}" for i in range(12)]
+         for c in ['ca','mb']},
+        index=labels
     )
     st.dataframe(df_fc, use_container_width=True)
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# ONGLET 7 — PRÊTS
+# PRÊTS
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[6]:
     st.subheader("Prêts en cours — indicatif")
-
-    if D['prets']:
-        for p in D['prets']:
-            tot = p['nb'] * p['ech'] + p['cap']
-            pct = min(100, round((1 - p['cap'] / tot) * 100)) if tot > 0 else 0
-            with st.expander(f"**{p['nom']}** — {fmt2(p['cap'])} restant"):
-                pc1, pc2, pc3 = st.columns(3)
-                pc1.metric("Capital restant", fmt2(p['cap']))
-                pc2.metric("Mensualité", fmt2(p['ech']))
-                pc3.metric("Mois restants", str(p['nb']))
-                st.progress(pct / 100, text=f"{pct}% remboursé")
-                if st.button("🗑 Supprimer", key=f"del_p_{p['id']}"):
-                    D['prets'] = [x for x in D['prets'] if x['id'] != p['id']]
-                    persist()
-                    st.rerun()
-    else:
-        st.info("Aucun prêt enregistré. Restaure ton JSON de sauvegarde.")
+    for p in D['prets']:
+        tot = p['nb']*p['ech']+p['cap']
+        pct = min(100, round((1-p['cap']/tot)*100)) if tot>0 else 0
+        with st.expander(f"**{p['nom']}** — {fmt2(p['cap'])} restant"):
+            with st.form(f"edit_pret_{p['id']}"):
+                pp1,pp2 = st.columns(2)
+                with pp1:
+                    pn = st.text_input("Nom", value=p['nom'])
+                    pc = st.number_input("Capital restant €", value=float(p['cap']), step=100.0, format="%.2f")
+                with pp2:
+                    pe = st.number_input("Mensualité €", value=float(p['ech']), step=10.0, format="%.2f")
+                    pnb = st.number_input("Mensualités restantes", value=int(p['nb']), step=1)
+                st.progress(pct/100, text=f"{pct}% remboursé")
+                if st.form_submit_button("💾 Enregistrer", use_container_width=True):
+                    idx = next(i for i,x in enumerate(D['prets']) if x['id']==p['id'])
+                    D['prets'][idx] = {'id':p['id'],'nom':pn,'cap':float(pc),'ech':float(pe),'nb':int(pnb)}
+                    persist(); st.success("✓"); st.rerun()
+            if st.button("🗑 Supprimer", key=f"del_p_{p['id']}"):
+                D['prets'] = [x for x in D['prets'] if x['id']!=p['id']]
+                persist(); st.rerun()
 
     st.divider()
     st.markdown("**Ajouter un prêt**")
-    with st.form("add_pret_form", clear_on_submit=True):
-        pp1, pp2 = st.columns(2)
-        with pp1:
-            p_nom = st.text_input("Nom", placeholder="Regroupement crédits…")
-            p_cap = st.number_input("Capital restant (€)", min_value=0.0, step=100.0)
-        with pp2:
-            p_ech = st.number_input("Mensualité (€)", min_value=0.0, step=10.0)
-            p_nb = st.number_input("Mensualités restantes", min_value=0, step=1)
+    with st.form("add_pret", clear_on_submit=True):
+        pp1,pp2 = st.columns(2)
+        pnom = pp1.text_input("Nom")
+        pcap = pp1.number_input("Capital restant €", min_value=0.0, step=100.0)
+        pech = pp2.number_input("Mensualité €", min_value=0.0, step=10.0)
+        pnb2 = pp2.number_input("Mensualités restantes", min_value=0, step=1)
         if st.form_submit_button("✅ Enregistrer", use_container_width=True):
-            D['prets'].append({'id': f"p_{int(datetime.now().timestamp()*1000)}",
-                               'nom': p_nom, 'cap': float(p_cap), 'ech': float(p_ech), 'nb': int(p_nb)})
-            persist()
-            st.success("✓ Prêt enregistré !")
-            st.rerun()
-
+            D['prets'].append({'id':f"p_{int(datetime.now().timestamp()*1000)}",'nom':pnom,
+                               'cap':float(pcap),'ech':float(pech),'nb':int(pnb2)})
+            persist(); st.success("✓"); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ONGLET 8 — CATÉGORIES
+# CATÉGORIES
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[7]:
     st.subheader("Catégories")
-    st.write(f"{len(D['cats'])} catégories enregistrées.")
-    for cat in D['cats']:
-        cc1, cc2 = st.columns([4, 1])
-        cc1.write(f"• {cat}")
-        if cc2.button("🗑", key=f"del_cat_{cat}"):
-            D['cats'].remove(cat)
-            persist()
-            st.rerun()
-    with st.form("add_cat_form", clear_on_submit=True):
-        new_cat = st.text_input("Nouvelle catégorie", placeholder="Ex: Animaux, Cadeaux…")
-        if st.form_submit_button("Ajouter"):
-            if new_cat and new_cat not in D['cats']:
-                D['cats'].append(new_cat)
-                persist()
-                st.success(f"✓ Catégorie « {new_cat} » ajoutée.")
-                st.rerun()
+    st.caption("Les catégories invisibles n'apparaissent plus dans les listes déroulantes mais les transactions existantes sont conservées.")
+    
+    vis_count = sum(1 for c in D['cats'] if c.get('visible',True))
+    st.info(f"**{vis_count}** visibles sur **{len(D['cats'])}** total")
 
+    changed = False
+    for cat in sorted(D['cats'], key=lambda c: c['nom']):
+        cc1,cc2,cc3 = st.columns([4,1,1])
+        cc1.write(f"{'✅' if cat.get('visible',True) else '🚫'} {cat['nom']}")
+        if cc2.button("👁" if not cat.get('visible',True) else "🙈",
+                      key=f"vis_{cat['nom']}", help="Rendre visible/invisible"):
+            cat['visible'] = not cat.get('visible',True)
+            changed = True
+    if changed:
+        persist(); st.rerun()
+
+    st.divider()
+    with st.form("add_cat", clear_on_submit=True):
+        new_cat_name = st.text_input("Nouvelle catégorie")
+        if st.form_submit_button("Ajouter"):
+            if new_cat_name and not any(c['nom']==new_cat_name for c in D['cats']):
+                D['cats'].append({'nom':new_cat_name,'visible':True})
+                persist(); st.success(f"✓ « {new_cat_name} » ajoutée."); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ONGLET 9 — SAUVEGARDE
+# SAUVEGARDE
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[8]:
     st.subheader("💾 Sauvegarde & Restauration")
-
-    bk1, bk2 = st.columns(2)
-
+    bk1,bk2 = st.columns(2)
     with bk1:
-        st.markdown("**📥 Exporter les données**")
-        backup = {
-            'version': 2, 'date': datetime.now().isoformat(),
-            'tx': D['tx'], 'cats': D['cats'], 'prets': D['prets'],
-            'rec': D['rec'], 'sol': D['sol'], 'overdraft': D['overdraft']
-        }
-        backup_json = json.dumps(backup, ensure_ascii=False, indent=2)
-        st.download_button(
-            "⬇️ Télécharger la sauvegarde JSON",
-            data=backup_json,
-            file_name=f"budget_backup_{datetime.now().strftime('%Y-%m-%d')}.json",
-            mime="application/json",
-            use_container_width=True
-        )
+        st.markdown("**📥 Exporter**")
+        backup = {'version':2,'date':datetime.now().isoformat(),
+                  'tx':D['tx'],'cats':D['cats'],'prets':D['prets'],
+                  'rec':D['rec'],'sol':D['sol'],'overdraft':D['overdraft']}
+        st.download_button("⬇️ Télécharger JSON",
+                           data=json.dumps(backup,ensure_ascii=False,indent=2),
+                           file_name=f"budget_backup_{datetime.now().strftime('%Y-%m-%d')}.json",
+                           mime="application/json", use_container_width=True)
         st.info(f"**{len(D['tx'])}** transactions · **{len(D['rec'])}** récurrentes · **{len(D['prets'])}** prêts")
-
     with bk2:
-        st.markdown("**📤 Restaurer depuis un fichier JSON**")
-        st.warning("⚠️ Cela remplacera toutes les données actuelles.")
-        uploaded = st.file_uploader("Choisir le fichier JSON", type=['json'])
+        st.markdown("**📤 Restaurer**")
+        st.warning("⚠️ Remplace toutes les données.")
+        uploaded = st.file_uploader("Fichier JSON", type=['json'])
         if uploaded:
             try:
                 data_in = json.load(uploaded)
                 if st.button("🔄 Restaurer", type="primary", use_container_width=True):
                     if data_in.get('tx'): D['tx'] = data_in['tx']
-                    if data_in.get('cats'): D['cats'] = data_in['cats']
+                    if data_in.get('cats'):
+                        cats_in = data_in['cats']
+                        if cats_in and isinstance(cats_in[0], str):
+                            cats_in = [{'nom':c,'visible':True} for c in cats_in]
+                        D['cats'] = cats_in
                     if data_in.get('prets'): D['prets'] = data_in['prets']
                     if data_in.get('rec'): D['rec'] = data_in['rec']
                     if data_in.get('sol'): D['sol'] = data_in['sol']
                     if data_in.get('overdraft'): D['overdraft'] = data_in['overdraft']
-                    persist()
-                    st.success(f"✓ {len(D['tx'])} transactions restaurées !")
-                    st.rerun()
+                    persist(); st.success(f"✓ {len(D['tx'])} transactions restaurées !"); st.rerun()
             except Exception as e:
                 st.error(f"Erreur : {e}")
-
     st.divider()
-    st.markdown("**📊 Export CSV des transactions**")
     if D['tx']:
-        df_exp = pd.DataFrame([{
-            'Date': t['date'], 'Compte': t['compte'], 'Catégorie': t['categorie'],
-            'Type': t['type'], 'Montant': t['montant'],
-            'Note': t.get('note', ''), 'AffMois': t.get('affM', ''), 'AffAnnée': t.get('affY', '')
-        } for t in D['tx']])
-        st.download_button("⬇️ Télécharger CSV", data=df_exp.to_csv(index=False, encoding='utf-8-sig'),
-                           file_name="budget_transactions.csv", mime="text/csv", use_container_width=True)
+        df_exp = pd.DataFrame([{'Date':t['date'],'Compte':t['compte'],'Catégorie':t['categorie'],
+                                 'Type':t['type'],'Montant':t['montant'],'Note':t.get('note','')} for t in D['tx']])
+        st.download_button("⬇️ Export CSV", data=df_exp.to_csv(index=False,encoding='utf-8-sig'),
+                           file_name="budget.csv", mime="text/csv", use_container_width=True)

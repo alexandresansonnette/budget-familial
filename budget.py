@@ -1282,7 +1282,13 @@ with tabs[4]:
         persist(); st.success(f"✓ {added} appliquée(s)."); st.rerun()
 
     st.divider()
-    for r in D['rec']:
+    # Filtre par compte
+    fopts_rec = {'all': 'Tous les comptes', **{k: v['label'] for k,v in COMPTES.items()}}
+    filt_rec_cpt = st.selectbox("Filtrer par compte", list(fopts_rec.keys()),
+                                 format_func=lambda x: fopts_rec[x], key="filt_rec_cpt")
+    rec_display = [r for r in D['rec'] if filt_rec_cpt == 'all' or r['compte'] == filt_rec_cpt]
+
+    for r in rec_display:
         done = rec_applied(r['id'],M,Y)
         icon = "✅" if done else "⏳"
         cpt = COMPTES.get(r['compte'],{'label':r['compte']})

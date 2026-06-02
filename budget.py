@@ -193,30 +193,76 @@ def month_net(cpt_id, m, y, forecast=False):
     return rec_n + (sum(past)/len(past) if past else 0)
 
 # ── Prévisionnel refondu ────────────────────────────────────────────────────────
-def resolve_sol(cpt_id, m, y, depth=12):
+def resolve_sol(cpt_id, target_m, target_y):
     """
-    Retourne (solde_debut_mois, source) en remontant l'historique si nécessaire.
+    Retourne (solde_debut_mois, source) pour (target_m, target_y).
+    Cherche le solde saisi le plus proche (passé en priorité, sinon futur),
+    puis propage mois par mois jusqu'à la cible.
     source = 'saisi' | 'calculé' | None
     """
-    v = get_sol(cpt_id, m, y)
+    # 1. Solde direct ?
+    v = get_sol(cpt_id, target_m, target_y)
     if v is not None:
         return v, 'saisi'
-    if depth <= 0:
+
+    target_abs = target_y * 12 + target_m
+
+    # 2. Chercher tous les soldes saisis dans D['sol'] pour ce compte
+    candidates = []
+    for key, val in D['sol'].items():
+        parts = key.split('_')
+        if len(parts) == 3 and parts[0] == cpt_id:
+            try:
+                ky, km = int(parts[1]), int(parts[2])
+                candidates.append((ky * 12 + km, km, ky, float(val)))
+            except ValueError:
+                pass
+
+    if not candidates:
         return None, None
-    pm, py = month_add(m, y, -1)
-    base, src = resolve_sol(cpt_id, pm, py, depth - 1)
-    if base is None:
+
+    # 3. Trouver le candidat le plus proche (passé en priorité)
+    past = [(abs_m, mm, yy, val) for abs_m, mm, yy, val in candidates if abs_m <= target_abs]
+    future = [(abs_m, mm, yy, val) for abs_m, mm, yy, val in candidates if abs_m > target_abs]
+
+    if past:
+        src_abs, src_m, src_y, src_val = max(past, key=lambda x: x[0])
+    elif future:
+        src_abs, src_m, src_y, src_val = min(future, key=lambda x: x[0])
+    else:
         return None, None
-    # Mouvements directs du compte sur le mois pm
-    mvt = sum(t['montant'] if t['type'] == 'revenu' else -t['montant']
-              for t in D['tx'] if t['compte'] == cpt_id and aff_key(t) == (py, pm))
-    # Pour CA : soustraire le cumul MC affecté au mois pm (prélevé en fin de mois)
-    if cpt_id == 'ca':
-        mc_total = sum(t['montant'] for t in D['tx']
-                       if t['compte'] == 'mc' and t['type'] == 'depense'
-                       and aff_key(t) == (py, pm))
-        mvt -= mc_total
-    return base + mvt, 'calculé'
+
+    # 4. Propager de src vers target mois par mois
+    sol = src_val
+    step = 1 if src_abs <= target_abs else -1
+    cur_abs = src_abs
+    while cur_abs != target_abs:
+        if step == 1:
+            # On avance : appliquer les mouvements du mois courant pour obtenir début mois suivant
+            cur_m, cur_y = cur_abs % 12, cur_abs // 12
+            mvt = sum(t['montant'] if t['type'] == 'revenu' else -t['montant']
+                      for t in D['tx'] if t['compte'] == cpt_id and aff_key(t) == (cur_y, cur_m))
+            if cpt_id == 'ca':
+                mc_total = sum(t['montant'] for t in D['tx']
+                               if t['compte'] == 'mc' and t['type'] == 'depense'
+                               and aff_key(t) == (cur_y, cur_m))
+                mvt -= mc_total
+            sol += mvt
+        else:
+            # On recule : soustraire les mouvements du mois précédent
+            prev_abs = cur_abs - 1
+            prev_m, prev_y = prev_abs % 12, prev_abs // 12
+            mvt = sum(t['montant'] if t['type'] == 'revenu' else -t['montant']
+                      for t in D['tx'] if t['compte'] == cpt_id and aff_key(t) == (prev_y, prev_m))
+            if cpt_id == 'ca':
+                mc_total = sum(t['montant'] for t in D['tx']
+                               if t['compte'] == 'mc' and t['type'] == 'depense'
+                               and aff_key(t) == (prev_y, prev_m))
+                mvt -= mc_total
+            sol -= mvt
+        cur_abs += step
+
+    return sol, 'calculé'
 
 
 def build_forecast_v2():
@@ -252,7 +298,7 @@ def build_forecast_v2():
     for cpt_id in ['ca', 'mb']:
         # Solde de départ : début du mois le plus ancien (-6)
         start_m, start_y = months[0]
-        base_sol, src = resolve_sol(cpt_id, start_m, start_y)
+        base_sol, src = resolve_sol(cpt_id, start_m, start_y)  # noqa
         if base_sol is None:
             warnings_out.append(
                 f"⚠️ Aucun solde historique trouvé pour **{COMPTES[cpt_id]['label']}** "
@@ -798,9 +844,9 @@ with tabs[5]:
 
     # Ligne verticale aujourd'hui
     fig.add_vline(
-        x=now_str,
+        x=datetime.now().timestamp() * 1000,
         line_dash="dot", line_color="gray", line_width=1.5,
-        annotation_text=f"Aujourd'hui", annotation_position="top right"
+        annotation_text="Aujourd'hui", annotation_position="top right"
     )
 
     fig.update_layout(

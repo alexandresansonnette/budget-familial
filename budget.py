@@ -643,25 +643,17 @@ def projection_fin_mois(cpt_id):
     """
     Projette le solde jour par jour de aujourd'hui à la fin du mois courant.
 
-    Prend en compte :
-      - Solde réel actuel (solde_a_date)
-      - Récurrentes restantes non appliquées (upcoming_rec)
-      - Revenus récurrents restants
-      - Encours MC restant à prélever sur CA (mc_depenses_reelles - mc_a_date)
-      - Transactions déjà saisies avec date future dans le mois
-
-    Retourne :
-      {
-        'solde_actuel': float | None,
-        'jours': [(date_str, solde, [evenements])],  # chaque jour jusqu'à fin mois
-        'solde_fin': float | None,
-        'point_bas': (date_str, float),
-        'point_bas_jour': int,
-        'manque': float,          # > 0 si dépassement découvert
-        'statut': 'ok' | 'warn' | 'danger',
-        'od': float,
-        'marge': float,
-      }
+    Logique des événements futurs :
+      1. Transactions déjà saisies avec date future (AVEC ou SANS recId)
+         → incluses telles quelles, elles représentent ce qui va sortir/rentrer
+      2. Récurrentes NON encore appliquées au mois (pas de TX avec ce recId)
+         → ajoutées à leur jour habituel
+         Attention : si une récurrente a déjà été appliquée (recId présent dans D['tx']),
+         elle est déjà comptée via le point 1, donc pas de doublon
+      3. MC restante sur CA : total MC affecté au mois entier
+         (passé + futur déjà saisi) moins ce qui a déjà été prélevé à ce jour
+         + MC récurrentes non encore appliquées
+         → prélevée le dernier jour du mois
     """
     now = datetime.now()
     m, y = now.month - 1, now.year
@@ -675,36 +667,39 @@ def projection_fin_mois(cpt_id):
                 'point_bas': (None, None), 'point_bas_jour': None,
                 'manque': 0, 'statut': 'ok', 'od': od, 'marge': None}
 
-    # Construire delta par jour (aujourd'hui+1 → fin mois)
     daily_events = defaultdict(list)  # jour → [(nom, montant_signé)]
 
-    # 1. Récurrentes restantes (revenus ET dépenses)
-    for r in D['rec']:
-        if r['compte'] == cpt_id and r['jour'] > now.day and not rec_applied(r['id'], m, y):
-            delta = r['mnt'] if r['type'] == 'revenu' else -r['mnt']
-            daily_events[r['jour']].append((r['nom'], delta))
-
-    # 2. MC restante à prélever sur CA : on l'affecte au dernier jour du mois
-    if cpt_id == 'ca':
-        mc_total_mois = mc_depenses_reelles(m, y)
-        mc_a_ce_jour  = mc_depenses_reelles(m, y, jusqu_au=now)
-        mc_restant = mc_total_mois - mc_a_ce_jour
-        # Ajouter MC récurrentes non encore appliquées
-        mc_restant += mc_rec_non_appliquees(m, y)
-        if mc_restant > 0:
-            daily_events[last_day].append(("Prélèvement MC", -mc_restant))
-
-    # 3. Transactions futures déjà saisies dans le mois (hors récurrentes)
+    # ── 1. Toutes les transactions futures du mois déjà saisies ───────────
+    # (avec OU sans recId — elles sont déjà dans D['tx'] donc certaines)
     for t in D['tx']:
         t_date = datetime.strptime(t['date'], '%Y-%m-%d')
         if (t['compte'] == cpt_id
                 and aff_key(t) == (y, m)
-                and t_date.date() > now.date()
-                and not t.get('recId')):
+                and t_date.date() > now.date()):
             delta = t['montant'] if t['type'] == 'revenu' else -t['montant']
-            daily_events[t_date.day].append((t.get('note') or t['categorie'], delta))
+            nom = t.get('note') or t['categorie']
+            daily_events[t_date.day].append((nom, delta))
 
-    # Construire la courbe jour par jour
+    # ── 2. Récurrentes NON encore appliquées (pas de doublon avec le point 1)
+    for r in D['rec']:
+        if r['compte'] == cpt_id and not rec_applied(r['id'], m, y):
+            # Seulement si le jour est dans le futur
+            if r['jour'] > now.day:
+                delta = r['mnt'] if r['type'] == 'revenu' else -r['mnt']
+                daily_events[r['jour']].append((r['nom'], delta))
+
+    # ── 3. MC restante à prélever sur CA ──────────────────────────────────
+    # = total MC du mois (déjà passé + futur saisi) - déjà prélevé à ce jour
+    # + MC récurrentes non encore appliquées (pas encore dans D['tx'])
+    if cpt_id == 'ca':
+        mc_total_mois = mc_depenses_reelles(m, y)          # TX MC déjà saisies
+        mc_a_ce_jour  = mc_depenses_reelles(m, y, jusqu_au=now)  # déjà prélevé
+        mc_rec_restant = mc_rec_non_appliquees(m, y)       # récurrentes MC futures
+        mc_a_prelever  = (mc_total_mois - mc_a_ce_jour) + mc_rec_restant
+        if mc_a_prelever > 0:
+            daily_events[last_day].append(("Prélèvement MC", -mc_a_prelever))
+
+    # ── Courbe jour par jour ───────────────────────────────────────────────
     sol = solde_act
     jours = []
     point_bas_sol = solde_act
@@ -715,14 +710,14 @@ def projection_fin_mois(cpt_id):
         for nom, delta in evts:
             sol += delta
         date_str = f"{day:02d}/{m+1:02d}"
-        jours.append((date_str, round(sol, 2), [(n, d) for n, d in evts]))
+        jours.append((date_str, round(sol, 2), list(evts)))
         if sol < point_bas_sol:
             point_bas_sol = sol
             point_bas_jour = day
 
     sol_fin = jours[-1][1] if jours else solde_act
-    marge = sol_fin - limite
-    manque = max(0, -(min(point_bas_sol, sol_fin) - limite))
+    marge   = sol_fin - limite
+    manque  = max(0.0, -(min(point_bas_sol, sol_fin) - limite))
 
     if point_bas_sol < limite:
         statut = 'danger'
@@ -733,15 +728,15 @@ def projection_fin_mois(cpt_id):
 
     return {
         'solde_actuel': solde_act,
-        'jours': jours,
-        'solde_fin': sol_fin,
-        'point_bas': (f"{point_bas_jour:02d}/{m+1:02d}", round(point_bas_sol, 2)),
+        'jours':        jours,
+        'solde_fin':    sol_fin,
+        'point_bas':    (f"{point_bas_jour:02d}/{m+1:02d}", round(point_bas_sol, 2)),
         'point_bas_jour': point_bas_jour,
-        'manque': round(manque, 2),
-        'statut': statut,
-        'od': od,
-        'marge': round(marge, 2),
-        'limite': limite,
+        'manque':       round(manque, 2),
+        'statut':       statut,
+        'od':           od,
+        'marge':        round(marge, 2),
+        'limite':       limite,
     }
 
 # ── CSS ─────────────────────────────────────────────────────────────────────────

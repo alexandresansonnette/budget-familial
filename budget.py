@@ -557,7 +557,7 @@ with tabs[4]:
                     rcat = st.selectbox("Catégorie", visible_cats(),
                                         index=visible_cats().index(r['cat']) if r['cat'] in visible_cats() else 0)
                     rmnt = st.number_input("Montant €", value=float(r['mnt']), step=0.01, format="%.2f")
-                    rjour = st.number_input("Jour du mois", value=int(r['jour']), min_value=1, max_value=28)
+                    rjour = st.number_input("Jour du mois", value=min(int(r["jour"]), 28), min_value=1, max_value=28)
                 if st.form_submit_button("💾 Enregistrer", use_container_width=True):
                     idx = next(i for i,x in enumerate(D['rec']) if x['id']==r['id'])
                     D['rec'][idx] = {**r,'nom':rn,'compte':rc,'cat':rcat,'mnt':float(rmnt),'type':rt,'jour':int(rjour)}

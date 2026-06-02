@@ -1332,13 +1332,14 @@ with tabs[4]:
             persist(); st.success("✓"); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PRÉVISIONNEL — barres entrées/sorties + ligne solde
+# PRÉVISIONNEL — vue consolidée foyer
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[5]:
-    st.subheader("Prévisionnel — CA & Monabanq")
+    st.subheader("Prévisionnel global du foyer")
     st.caption(
-        "**Passé** : entrées/sorties réelles par mois · MC intégrée dans CA  |  "
-        "**Futur** : estimé (récurrentes + moyenne TX passées) · pointillé"
+        "Prévision indicative basée sur l'historique disponible. "
+        "Plus l'historique grandit, plus l'estimation devient fiable. "
+        "**Passé** : réel · **Futur** : pointillé avec intervalle de confiance · MC intégrée dans CA"
     )
 
     months, daily_series, monthly_series, fc_warnings = build_forecast_v2()
@@ -1346,19 +1347,14 @@ with tabs[5]:
     for w in fc_warnings:
         st.warning(w)
 
-    now = datetime.now()
+    now_pv = datetime.now()
 
-    # ── Construire les données par mois pour chaque compte ─────────────────
-    # Prévision par catégorie pour les mois futurs (partagée entre comptes)
+    # ── Prévision par catégorie pour les mois futurs ───────────────────────
     future_months_list = [months[i] for i in range(7, 12)]
     fc_by_cpt = {cpt_id: prevision_depenses(cpt_id, future_months_list)
                  for cpt_id in ['ca', 'mb']}
 
     def month_bars(cpt_id):
-        """
-        Retourne pour chaque mois une dict :
-          label, entrees, sorties, sol, sol_min, sol_max, is_fc, fc_detail
-        """
         rows = []
         fc_list = fc_by_cpt[cpt_id]
         fc_idx = 0
@@ -1375,7 +1371,6 @@ with tabs[5]:
                 if cpt_id == 'ca':
                     sorties += mc_depenses_reelles(m, y)
                 sol_min = sol_max = None
-                sol_min = sol_max = None
             else:
                 fc = fc_list[fc_idx] if fc_idx < len(fc_list) else None
                 fc_idx += 1
@@ -1383,16 +1378,12 @@ with tabs[5]:
                 if fc:
                     entrees = rec_e
                     sorties = fc['total_moyen']
-                    sol_min_dep = fc['total_max']
-                    sol_max_dep = fc['total_min']
                     fc_detail = fc['par_categorie']
                 else:
                     entrees = rec_e
                     sorties = 0.0
-                    sol_min_dep = sol_max_dep = 0.0
-                sol_min = sol_max = None  # calculé depuis monthly_series
+                sol_min = sol_max = None
 
-            # Solde depuis monthly_series (nouveau format)
             ms_entry = next(((v,vmi,vma) for v,vmi,vma,lbl,ifc in monthly_series[cpt_id] if lbl==label), (None,None,None))
             sol_fin, sol_min_s, sol_max_s = ms_entry
             if is_fc:
@@ -1406,127 +1397,284 @@ with tabs[5]:
             })
         return rows
 
-    # ── Graphique pour chaque compte ───────────────────────────────────────
-    for cpt_id in ['ca', 'mb']:
-        cpt = COMPTES[cpt_id]
-        color_sol = cpt['color']
-        rows = month_bars(cpt_id)
+    rows_ca = month_bars('ca')
+    rows_mb = month_bars('mb')
 
-        labels    = [r['label'] for r in rows]
-        entrees   = [r['entrees'] for r in rows]
-        sorties   = [r['sorties'] for r in rows]
-        sols      = [r['sol'] for r in rows]
-        is_fc     = [r['is_fc'] for r in rows]
+    # ── Helper : agréger CA + MB sans recalculer ───────────────────────────
+    def agreger_rows(rca, rmb):
+        """
+        Agrège les rows CA et MB mois par mois.
+        Entrées/sorties : somme simple (les virements internes se neutralisent).
+        Solde global : somme des soldes individuels quand les deux sont disponibles.
+        IC global : somme des IC individuels.
+        """
+        result = []
+        for a, b in zip(rca, rmb):
+            sol_g     = (a['sol'] + b['sol']) if (a['sol'] is not None and b['sol'] is not None) else None
+            sol_min_g = (a['sol_min'] + b['sol_min']) if (a['sol_min'] is not None and b['sol_min'] is not None) else None
+            sol_max_g = (a['sol_max'] + b['sol_max']) if (a['sol_max'] is not None and b['sol_max'] is not None) else None
+            result.append({
+                'label':    a['label'],
+                'entrees':  a['entrees']  + b['entrees'],
+                'sorties':  a['sorties']  + b['sorties'],
+                'sol':      sol_g,
+                'sol_min':  sol_min_g,
+                'sol_max':  sol_max_g,
+                'is_fc':    a['is_fc'],
+            })
+        return result
 
-        # Opacité : passé=1, futur=0.45
-        op_in  = [0.45 if f else 1.0 for f in is_fc]
-        op_out = [0.45 if f else 1.0 for f in is_fc]
+    rows_global = agreger_rows(rows_ca, rows_mb)
 
-        fig = go.Figure()
+    # ══ GRAPHIQUE GLOBAL ══════════════════════════════════════════════════
+    labels_g  = [r['label']   for r in rows_global]
+    entrees_g = [r['entrees'] for r in rows_global]
+    sorties_g = [r['sorties'] for r in rows_global]
+    sols_g    = [r['sol']     for r in rows_global]
+    is_fc_g   = [r['is_fc']   for r in rows_global]
 
-        # Zone rouge sous 0
-        sol_vals = [s for s in sols if s is not None]
-        y_min_s = min(sol_vals)*1.15 if sol_vals else -500
-        fig.add_hrect(y0=y_min_s, y1=0, fillcolor="rgba(220,50,50,0.05)", line_width=0)
+    op_in  = [0.4 if f else 1.0 for f in is_fc_g]
+    op_out = [0.4 if f else 1.0 for f in is_fc_g]
 
-        # Barres entrées (vert)
-        fig.add_trace(go.Bar(
-            x=labels, y=entrees,
-            name="Entrées",
-            marker_color=[f"rgba(29,158,117,{o})" for o in op_in],
-            offsetgroup=0,
-            hovertemplate='%{x}<br>Entrées : %{y:,.0f} €<extra></extra>'
-        ))
+    COLOR_GLOBAL = "#5A2070"   # Aubergine secondaire
+    r_g, g_g, b_g = int(COLOR_GLOBAL[1:3],16), int(COLOR_GLOBAL[3:5],16), int(COLOR_GLOBAL[5:7],16)
 
-        # Barres sorties (rouge, vers le bas)
-        fig.add_trace(go.Bar(
-            x=labels, y=[-s for s in sorties],
-            name="Sorties",
-            marker_color=[f"rgba(226,75,74,{o})" for o in op_out],
-            offsetgroup=1,
-            hovertemplate='%{x}<br>Sorties : %{customdata:,.0f} €<extra></extra>',
-            customdata=sorties
-        ))
+    fig_g = go.Figure()
 
-        # Ligne de solde passé
-        fig.add_trace(go.Scatter(
-            x=[labels[i] for i,v in enumerate(sols) if v is not None and not is_fc[i]],
-            y=[v for i,v in enumerate(sols) if v is not None and not is_fc[i]],
+    # Zone rouge sous 0
+    sol_vals_g = [s for s in sols_g if s is not None]
+    y_min_g = min(sol_vals_g)*1.15 if sol_vals_g else -1000
+    fig_g.add_hrect(y0=y_min_g, y1=0, fillcolor="rgba(220,50,50,0.04)", line_width=0)
+
+    # Barres entrées
+    fig_g.add_trace(go.Bar(
+        x=labels_g, y=entrees_g,
+        name="Entrées foyer",
+        marker_color=[f"rgba(29,158,117,{o})" for o in op_in],
+        offsetgroup=0,
+        hovertemplate='%{x}<br>Entrées : %{y:,.0f} €<extra></extra>'
+    ))
+
+    # Barres sorties (vers le bas)
+    fig_g.add_trace(go.Bar(
+        x=labels_g, y=[-s for s in sorties_g],
+        name="Sorties foyer",
+        marker_color=[f"rgba(226,75,74,{o})" for o in op_out],
+        offsetgroup=1,
+        hovertemplate='%{x}<br>Sorties : %{customdata:,.0f} €<extra></extra>',
+        customdata=sorties_g
+    ))
+
+    # Ligne solde global passé
+    real_g = [(i, v) for i, v in enumerate(sols_g) if v is not None and not is_fc_g[i]]
+    fc_g   = [(i, v) for i, v in enumerate(sols_g) if v is not None and is_fc_g[i]]
+
+    if real_g:
+        fig_g.add_trace(go.Scatter(
+            x=[labels_g[i] for i, v in real_g],
+            y=[v for i, v in real_g],
             mode='lines+markers',
-            name=f"Solde {cpt['label'].split()[0]}",
-            line=dict(color=color_sol, width=2.5),
-            marker=dict(size=6),
+            name="Solde global",
+            line=dict(color=COLOR_GLOBAL, width=3),
+            marker=dict(size=7),
             hovertemplate='%{x}<br>Solde : %{y:,.0f} €<extra></extra>'
         ))
-        # Solde futur + intervalle de confiance
-        real_sols = [(i,v) for i,v in enumerate(sols) if v is not None and not is_fc[i]]
-        fc_sols   = [(i,v) for i,v in enumerate(sols) if v is not None and is_fc[i]]
-        sol_mins  = [rows[i]['sol_min'] for i,v in enumerate(sols) if v is not None and is_fc[i]]
-        sol_maxs  = [rows[i]['sol_max'] for i,v in enumerate(sols) if v is not None and is_fc[i]]
-        if real_sols and fc_sols:
-            anchor_i, anchor_v = real_sols[-1]
-            x_fc = [labels[anchor_i]] + [labels[i] for i,v in fc_sols]
-            y_fc = [anchor_v] + [v for i,v in fc_sols]
-            y_lo = [anchor_v] + [v if v is not None else y_fc[j+1] for j,v in enumerate(sol_mins)]
-            y_hi = [anchor_v] + [v if v is not None else y_fc[j+1] for j,v in enumerate(sol_maxs)]
-            r_int = int(color_sol[1:3], 16)
-            g_int = int(color_sol[3:5], 16)
-            b_int = int(color_sol[5:7], 16)
-            # Zone IC
-            fig.add_trace(go.Scatter(
-                x=x_fc + x_fc[::-1],
-                y=y_hi + y_lo[::-1],
-                fill='toself',
-                fillcolor=f"rgba({r_int},{g_int},{b_int},0.12)",
-                line=dict(width=0),
-                showlegend=False,
-                hoverinfo='skip',
-                name='IC'
-            ))
-            # Ligne centrale pointillée
-            fig.add_trace(go.Scatter(
-                x=x_fc, y=y_fc,
-                mode='lines+markers',
-                name=f"Solde prévu",
-                showlegend=False,
-                line=dict(color=color_sol, width=1.5, dash='dot'),
-                marker=dict(size=6, symbol='circle-open'),
-                hovertemplate='%{x}<br>Estimé : %{y:,.0f} €<extra></extra>'
-            ))
 
-        # Ligne découvert
-        od_val = D['overdraft'].get(cpt_id, 0)
-        if od_val > 0:
-            fig.add_hline(y=-od_val, line_dash="dash", line_color=color_sol,
-                          line_width=1, opacity=0.4,
-                          annotation_text=f"Découvert max", annotation_position="bottom right")
+    # IC + ligne pointillée future
+    if real_g and fc_g:
+        anchor_i, anchor_v = real_g[-1]
+        x_fc_g = [labels_g[anchor_i]] + [labels_g[i] for i, v in fc_g]
+        y_fc_g = [anchor_v] + [v for i, v in fc_g]
+        sol_mins_g = [rows_global[i]['sol_min'] for i, v in fc_g]
+        sol_maxs_g = [rows_global[i]['sol_max'] for i, v in fc_g]
+        y_lo_g = [anchor_v] + [v if v is not None else y_fc_g[j+1] for j, v in enumerate(sol_mins_g)]
+        y_hi_g = [anchor_v] + [v if v is not None else y_fc_g[j+1] for j, v in enumerate(sol_maxs_g)]
 
-        # Ligne verticale aujourd'hui
-        today_label = f"{MOIS_COURT[now.month-1]} {now.year}"
-        if today_label in labels:
-            fig.add_vline(
-                x=today_label,
-                line_dash="dot", line_color="gray", line_width=1.5
+        # Zone IC
+        fig_g.add_trace(go.Scatter(
+            x=x_fc_g + x_fc_g[::-1],
+            y=y_hi_g + y_lo_g[::-1],
+            fill='toself',
+            fillcolor=f"rgba({r_g},{g_g},{b_g},0.10)",
+            line=dict(width=0),
+            showlegend=False,
+            hoverinfo='skip',
+            name='IC global'
+        ))
+        # Ligne centrale
+        fig_g.add_trace(go.Scatter(
+            x=x_fc_g, y=y_fc_g,
+            mode='lines+markers',
+            name="Solde global estimé",
+            showlegend=False,
+            line=dict(color=COLOR_GLOBAL, width=2, dash='dot'),
+            marker=dict(size=7, symbol='circle-open'),
+            hovertemplate='%{x}<br>Estimé : %{y:,.0f} €<extra></extra>'
+        ))
+
+    # Ligne 0
+    fig_g.add_hline(y=0, line_color="rgba(0,0,0,0.15)", line_width=1)
+
+    # Ligne verticale aujourd'hui
+    today_lbl = f"{MOIS_COURT[now_pv.month-1]} {now_pv.year}"
+    if today_lbl in labels_g:
+        fig_g.add_vline(x=today_lbl, line_dash="dot", line_color="gray",
+                        line_width=1.5, annotation_text="Aujourd'hui",
+                        annotation_position="top right")
+
+    fig_g.update_layout(
+        barmode='group',
+        height=400,
+        hovermode='x unified',
+        margin=dict(t=20, b=60, l=60, r=20),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.2, xanchor="center", x=0.5),
+        yaxis_title="€",
+        bargap=0.2, bargroupgap=0.05,
+        plot_bgcolor='rgba(0,0,0,0)'
+    )
+    st.plotly_chart(fig_g, width="stretch")
+
+    # ══ CARTES SYNTHÉTIQUES CA / MB ═══════════════════════════════════════
+    card_cols = st.columns(2)
+    for ci, cpt_id in enumerate(['ca', 'mb']):
+        rows_c = rows_ca if cpt_id == 'ca' else rows_mb
+        cpt    = COMPTES[cpt_id]
+        color  = cpt['color']
+
+        # Solde prévu fin de période (dernier mois futur non-None)
+        fc_rows = [r for r in rows_c if r['is_fc'] and r['sol'] is not None]
+        sol_fin_c  = fc_rows[-1]['sol']  if fc_rows else None
+        sol_min_fc = [r['sol'] for r in fc_rows if r['sol'] is not None]
+        point_bas  = min(sol_min_fc) if sol_min_fc else sol_fin_c
+        pb_label   = next((r['label'] for r in fc_rows if r['sol'] == point_bas), "—")
+
+        # Tendance : pente entre premier et dernier sol futur
+        if len(sol_min_fc) >= 2:
+            delta_fc = sol_min_fc[-1] - sol_min_fc[0]
+            if delta_fc > 200:   tendance_txt, tendance_col = "↗ En hausse",  "#1D9E75"
+            elif delta_fc < -200: tendance_txt, tendance_col = "↘ En baisse",  "#E24B4A"
+            else:                 tendance_txt, tendance_col = "→ Stable",     "#888"
+        else:
+            tendance_txt, tendance_col = "— Insuffisant", "#888"
+
+        # Vigilance
+        od_c = D['overdraft'].get(cpt_id, 0)
+        if point_bas is not None and point_bas < -od_c:
+            vig_txt, vig_bg, vig_border = "🔴 Risque découvert", "#fdf0f0", "#E24B4A"
+        elif point_bas is not None and point_bas < (-od_c + 300):
+            vig_txt, vig_bg, vig_border = "🟠 Vigilance", "#fff8e6", "#D97706"
+        else:
+            vig_txt, vig_bg, vig_border = "🟢 OK", "#f0faf4", "#1D9E75"
+
+        sol_fin_str  = fmt2(sol_fin_c)  if sol_fin_c  is not None else "—"
+        point_bas_str = fmt2(point_bas) if point_bas  is not None else "—"
+        pb_color = "#E24B4A" if (point_bas or 0) < 0 else "#555"
+
+        with card_cols[ci]:
+            st.markdown(f"""
+            <div style="border:1.5px solid {vig_border};border-radius:12px;
+                        background:{vig_bg};padding:16px 18px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                    <strong style="font-size:14px;color:{color}">{cpt['label']}</strong>
+                    <span style="font-size:12px;font-weight:600;color:{vig_border}">{vig_txt}</span>
+                </div>
+                <div style="display:flex;gap:16px;">
+                    <div style="flex:1;text-align:center;">
+                        <div style="font-size:11px;color:#888;margin-bottom:2px;">Solde fin période</div>
+                        <div style="font-size:18px;font-weight:700;
+                             color:{'#E24B4A' if (sol_fin_c or 0)<0 else '#1D9E75'}">{sol_fin_str}</div>
+                    </div>
+                    <div style="flex:1;text-align:center;">
+                        <div style="font-size:11px;color:#888;margin-bottom:2px;">Point bas ({pb_label})</div>
+                        <div style="font-size:16px;font-weight:600;color:{pb_color}">{point_bas_str}</div>
+                    </div>
+                    <div style="flex:1;text-align:center;">
+                        <div style="font-size:11px;color:#888;margin-bottom:2px;">Tendance</div>
+                        <div style="font-size:14px;font-weight:600;color:{tendance_col}">{tendance_txt}</div>
+                    </div>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+    st.markdown("")  # espacement
+
+    # ══ EXPANDER : DÉTAIL PAR COMPTE ══════════════════════════════════════
+    with st.expander("📊 Voir le détail par compte", expanded=False):
+        for cpt_id in ['ca', 'mb']:
+            cpt = COMPTES[cpt_id]
+            color_sol = cpt['color']
+            rows = rows_ca if cpt_id == 'ca' else rows_mb
+            r_c = int(color_sol[1:3],16)
+            g_c = int(color_sol[3:5],16)
+            b_c = int(color_sol[5:7],16)
+
+            labels    = [r['label']   for r in rows]
+            entrees   = [r['entrees'] for r in rows]
+            sorties   = [r['sorties'] for r in rows]
+            sols      = [r['sol']     for r in rows]
+            is_fc     = [r['is_fc']   for r in rows]
+            op_i = [0.4 if f else 1.0 for f in is_fc]
+
+            fig_d = go.Figure()
+            sol_vals_d = [s for s in sols if s is not None]
+            y_min_d = min(sol_vals_d)*1.15 if sol_vals_d else -500
+            fig_d.add_hrect(y0=y_min_d, y1=0, fillcolor="rgba(220,50,50,0.05)", line_width=0)
+
+            fig_d.add_trace(go.Bar(x=labels, y=entrees, name="Entrées",
+                marker_color=[f"rgba(29,158,117,{o})" for o in op_i],
+                offsetgroup=0, hovertemplate='%{x}<br>Entrées : %{y:,.0f} €<extra></extra>'))
+            fig_d.add_trace(go.Bar(x=labels, y=[-s for s in sorties], name="Sorties",
+                marker_color=[f"rgba(226,75,74,{o})" for o in op_i],
+                offsetgroup=1, customdata=sorties,
+                hovertemplate='%{x}<br>Sorties : %{customdata:,.0f} €<extra></extra>'))
+
+            real_d = [(i,v) for i,v in enumerate(sols) if v is not None and not is_fc[i]]
+            fc_d   = [(i,v) for i,v in enumerate(sols) if v is not None and is_fc[i]]
+            if real_d:
+                fig_d.add_trace(go.Scatter(
+                    x=[labels[i] for i,v in real_d], y=[v for i,v in real_d],
+                    mode='lines+markers', name=f"Solde {cpt['label'].split()[0]}",
+                    line=dict(color=color_sol, width=2.5), marker=dict(size=6),
+                    hovertemplate='%{x}<br>Solde : %{y:,.0f} €<extra></extra>'))
+            if real_d and fc_d:
+                ai, av = real_d[-1]
+                x_fc_d = [labels[ai]] + [labels[i] for i,v in fc_d]
+                y_fc_d = [av] + [v for i,v in fc_d]
+                y_lo_d = [av] + [rows[i]['sol_min'] or v for i,v in fc_d]
+                y_hi_d = [av] + [rows[i]['sol_max'] or v for i,v in fc_d]
+                fig_d.add_trace(go.Scatter(
+                    x=x_fc_d+x_fc_d[::-1], y=y_hi_d+y_lo_d[::-1],
+                    fill='toself', fillcolor=f"rgba({r_c},{g_c},{b_c},0.12)",
+                    line=dict(width=0), showlegend=False, hoverinfo='skip'))
+                fig_d.add_trace(go.Scatter(
+                    x=x_fc_d, y=y_fc_d, mode='lines+markers', showlegend=False,
+                    line=dict(color=color_sol, width=1.5, dash='dot'),
+                    marker=dict(size=6, symbol='circle-open'),
+                    hovertemplate='%{x}<br>Estimé : %{y:,.0f} €<extra></extra>'))
+
+            od_v = D['overdraft'].get(cpt_id, 0)
+            if od_v > 0:
+                fig_d.add_hline(y=-od_v, line_dash="dash", line_color=color_sol,
+                                line_width=1, opacity=0.4,
+                                annotation_text="Découvert max", annotation_position="bottom right")
+            if today_lbl in labels:
+                fig_d.add_vline(x=today_lbl, line_dash="dot", line_color="gray", line_width=1.5)
+
+            fig_d.update_layout(
+                title=dict(text=cpt['label'], font=dict(size=13)),
+                barmode='group', height=300,
+                hovermode='x unified',
+                margin=dict(t=35, b=50, l=50, r=20),
+                legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5),
+                yaxis_title="€", bargap=0.2, bargroupgap=0.05,
+                plot_bgcolor='rgba(0,0,0,0)'
             )
+            st.plotly_chart(fig_d, width="stretch")
 
-        fig.update_layout(
-            title=dict(text=cpt['label'], font=dict(size=14)),
-            barmode='group',
-            height=320,
-            hovermode='x unified',
-            margin=dict(t=40, b=50, l=50, r=20),
-            legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
-            yaxis_title="€",
-            bargap=0.2,
-            bargroupgap=0.05
-        )
-        st.plotly_chart(fig, width="stretch")
-
-    # ── Tableau récap ───────────────────────────────────────────────────────
+    # ══ TABLEAUX ET DÉTAIL CATÉGORIES ═════════════════════════════════════
     with st.expander("Tableau mensuel", expanded=False):
         for cpt_id in ['ca', 'mb']:
             st.markdown(f"**{COMPTES[cpt_id]['label']}**")
-            rows_t = month_bars(cpt_id)
+            rows_t = rows_ca if cpt_id == 'ca' else rows_mb
             df_rows = []
             for r in rows_t:
                 prefix = "~" if r['is_fc'] else ""
@@ -1547,13 +1695,14 @@ with tabs[5]:
         TENDANCE_ICON = {'hausse': '↑', 'baisse': '↓', 'stable': '→', 'insuffisant': '?'}
         for cpt_id in ['ca', 'mb']:
             st.markdown(f"**{COMPTES[cpt_id]['label']}**")
-            rows_fc = [r for r in month_bars(cpt_id) if r['is_fc'] and r['fc_detail']]
-            if not rows_fc:
+            rows_c2 = rows_ca if cpt_id == 'ca' else rows_mb
+            rows_fc2 = [r for r in rows_c2 if r['is_fc'] and r['fc_detail']]
+            if not rows_fc2:
                 st.info("Pas encore de données suffisantes pour ce compte.")
                 continue
-            for r in rows_fc:
+            for r in rows_fc2:
                 ic = f"[{round(r['sol_min'] or 0):,} – {round(r['sol_max'] or 0):,} €]".replace(",", " ")
-                st.markdown(f"*{r['label']}* — sorties estimées **{round(r['sorties']):,} €** · Solde estimé {ic}".replace(",", " "))
+                st.markdown(f"*{r['label']}* — sorties estimées **{round(r['sorties']):,} €** · Solde {ic}".replace(",", " "))
                 cat_data = []
                 for cat, d in sorted(r['fc_detail'].items(), key=lambda x: -x[1]['moyen']):
                     if d['moyen'] < 1: continue
@@ -1567,6 +1716,7 @@ with tabs[5]:
                     })
                 if cat_data:
                     st.dataframe(pd.DataFrame(cat_data).set_index('Catégorie'), width="stretch")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PRÊTS

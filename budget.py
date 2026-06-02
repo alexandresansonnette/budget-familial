@@ -93,15 +93,40 @@ def save_to_gsheet(data):
             ws = sh.worksheet("data")
         except gspread.WorksheetNotFound:
             ws = sh.add_worksheet(title="data", rows=2000, cols=2)
+
         payload = json.dumps(data, ensure_ascii=False)
         chunks = [payload[i:i+40000] for i in range(0, len(payload), 40000)]
+
+        # Écrire dans un onglet tampon d'abord (évite la perte si clear() plante)
+        try:
+            ws_tmp = sh.worksheet("data_tmp")
+            ws_tmp.clear()
+        except gspread.WorksheetNotFound:
+            ws_tmp = sh.add_worksheet(title="data_tmp", rows=2000, cols=2)
+        ws_tmp.update(
+            range_name=f"A1:A{len(chunks)}",
+            values=[[chunk] for chunk in chunks]
+        )
+
+        # Lecture de contrôle : vérifier que le tampon est lisible et cohérent
+        readback = "".join(ws_tmp.col_values(1))
+        data_check = json.loads(readback)
+        if len(data_check.get('tx', [])) != len(data.get('tx', [])):
+            raise ValueError(f"Contrôle échoué : {len(data_check.get('tx',[]))} TX relues vs {len(data.get('tx',[]))} attendues")
+
+        # Tout est OK → écrire dans l'onglet principal
         ws.clear()
         ws.update(
             range_name=f"A1:A{len(chunks)}",
             values=[[chunk] for chunk in chunks]
         )
+
+        # Stocker timestamp dernière sauvegarde réussie
+        st.session_state['last_save_ok'] = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+
     except Exception as e:
-        st.error(f"Erreur de sauvegarde : {e}")
+        st.error(f"❌ Erreur de sauvegarde : {e}")
+        st.warning("⚠️ Les données n'ont PAS été sauvegardées. Exportez un JSON de secours immédiatement.")
 
 # ── Session state ───────────────────────────────────────────────────────────────
 if 'data' not in st.session_state:
@@ -198,6 +223,35 @@ def month_net(cpt_id, m, y, forecast=False):
             past.append(sum(t['montant'] if t['type']=='revenu' else -t['montant'] for t in txs))
     return rec_n + (sum(past)/len(past) if past else 0)
 
+# ── Fonctions centralisées Mastercard ───────────────────────────────────────
+# Source unique de vérité pour tous les calculs MC → zéro double comptage
+
+def mc_depenses_reelles(m, y, jusqu_au=None):
+    """
+    Total des dépenses MC affectées au mois (m, y) 0-indexed.
+    jusqu_au : datetime optionnel — ne prend que les TX dont date réelle <= jusqu_au.
+    Utilisé pour : encours à date, solde mensuel CA, prévisionnel, trésorerie.
+    """
+    txs = [t for t in D['tx']
+           if t['compte'] == 'mc'
+           and t['type'] == 'depense'
+           and aff_key(t) == (y, m)]
+    if jusqu_au is not None:
+        txs = [t for t in txs
+               if datetime.strptime(t['date'], '%Y-%m-%d') <= jusqu_au]
+    return sum(t['montant'] for t in txs)
+
+def mc_rec_depenses():
+    """Total mensuel des récurrentes MC dépenses (montant fixe prévisible)."""
+    return sum(r['mnt'] for r in D['rec']
+               if r['compte'] == 'mc' and r['type'] == 'depense')
+
+def mc_rec_non_appliquees(m, y):
+    """Récurrentes MC dépenses pas encore appliquées au mois (m, y) 0-indexed."""
+    return sum(r['mnt'] for r in D['rec']
+               if r['compte'] == 'mc' and r['type'] == 'depense'
+               and not rec_applied(r['id'], m, y))
+
 # ── Prévisionnel refondu ────────────────────────────────────────────────────────
 def resolve_sol(cpt_id, target_m, target_y):
     """
@@ -249,10 +303,7 @@ def resolve_sol(cpt_id, target_m, target_y):
             mvt = sum(t['montant'] if t['type'] == 'revenu' else -t['montant']
                       for t in D['tx'] if t['compte'] == cpt_id and aff_key(t) == (cur_y, cur_m))
             if cpt_id == 'ca':
-                mc_total = sum(t['montant'] for t in D['tx']
-                               if t['compte'] == 'mc' and t['type'] == 'depense'
-                               and aff_key(t) == (cur_y, cur_m))
-                mvt -= mc_total
+                mvt -= mc_depenses_reelles(cur_m, cur_y)
             sol += mvt
         else:
             # On recule : soustraire les mouvements du mois précédent
@@ -261,10 +312,7 @@ def resolve_sol(cpt_id, target_m, target_y):
             mvt = sum(t['montant'] if t['type'] == 'revenu' else -t['montant']
                       for t in D['tx'] if t['compte'] == cpt_id and aff_key(t) == (prev_y, prev_m))
             if cpt_id == 'ca':
-                mc_total = sum(t['montant'] for t in D['tx']
-                               if t['compte'] == 'mc' and t['type'] == 'depense'
-                               and aff_key(t) == (prev_y, prev_m))
-                mvt -= mc_total
+                mvt -= mc_depenses_reelles(prev_m, prev_y)
             sol -= mvt
         cur_abs += step
 
@@ -388,8 +436,7 @@ def prevision_depenses(cpt_id, mois_cibles):
     rec_total_ca_propre = sum(r['mnt'] for r in D['rec']
                               if r['compte'] == cpt_id and r['type'] == 'depense')
     # MC récurrentes ajoutées séparément pour CA (débit différé fixe)
-    mc_rec_total = sum(r['mnt'] for r in D['rec']
-                       if r['compte'] == 'mc' and r['type'] == 'depense') if cpt_id == 'ca' else 0.0
+    mc_rec_total = mc_rec_depenses() if cpt_id == 'ca' else 0.0
 
     results = []
     for target_m, target_y in mois_cibles:
@@ -483,12 +530,7 @@ def build_forecast_v2():
 
             # Cumul MC affecté à ce mois (soustrait le dernier jour sur CA)
             mc_cumul = 0.0
-            if cpt_id == 'ca':
-                mc_cumul = sum(
-                    t['montant'] for t in D['tx']
-                    if t['compte'] == 'mc' and t['type'] == 'depense'
-                    and aff_key(t) == (y, m)
-                )
+            mc_cumul = mc_depenses_reelles(m, y) if cpt_id == 'ca' else 0.0
 
             # Deltas par jour
             daily_delta = defaultdict(float)
@@ -504,11 +546,7 @@ def build_forecast_v2():
                         delta = r['mnt'] if r['type'] == 'revenu' else -r['mnt']
                         daily_delta[r['jour']] += delta
                 if cpt_id == 'ca':
-                    # Ajouter MC récurrentes non encore prélevées ce mois
-                    mc_rec = sum(r['mnt'] for r in D['rec']
-                                 if r['compte'] == 'mc' and r['type'] == 'depense'
-                                 and not rec_applied(r['id'], m, y))
-                    mc_cumul += mc_rec
+                    mc_cumul += mc_rec_non_appliquees(m, y)
 
             # Construire point par jour
             sol_day = sol_running
@@ -671,9 +709,7 @@ with tabs[0]:
             # Encours MC affiché uniquement sur CA
             mc_encours_html = ""
             if cpt_id == 'ca':
-                mc_encours = sum(t['montant'] for t in D['tx']
-                                 if t['compte'] == 'mc' and t['type'] == 'depense'
-                                 and aff_key(t) == (now.year, now.month - 1))
+                mc_encours = mc_depenses_reelles(now.month - 1, now.year, jusqu_au=now)
                 mc_color = COMPTES['mc']['color']
                 mc_encours_html = f"""<hr style="border:none;border-top:1px solid #e0e0e0;margin:8px 0">
                 <small style="color:#888">Encours Mastercard ce mois</small><br>
@@ -745,11 +781,9 @@ with tabs[0]:
             # MC restante sur CA
             mc_restant = 0.0
             if cpt_id == 'ca':
-                # MC déjà passée ce mois (affectée au mois courant, date > aujourd'hui)
-                mc_restant = -sum(t['montant'] for t in D['tx']
-                                  if t['compte']=='mc' and t['type']=='depense'
-                                  and aff_key(t)==(now_y, now_m)
-                                  and datetime.strptime(t['date'],'%Y-%m-%d') > now)
+                mc_tot  = mc_depenses_reelles(now_m, now_y)
+                mc_deja = mc_depenses_reelles(now_m, now_y, jusqu_au=now)
+                mc_restant = -(mc_tot - mc_deja)
 
             solde_proj = solde_now + rec_restant + mc_restant
             limite = -od
@@ -831,11 +865,7 @@ with tabs[1]:
             entrees = sum(t['montant'] for t in tx_m if t['compte']==cpt_id and t['type']=='revenu')
             sorties = sum(t['montant'] for t in tx_m if t['compte']==cpt_id and t['type']=='depense')
             # Pour CA : ajouter les dépenses MC affectées à ce mois dans les sorties
-            mc_ce_mois = 0.0
-            if cpt_id == 'ca':
-                mc_ce_mois = sum(t['montant'] for t in D['tx']
-                                 if t['compte']=='mc' and t['type']=='depense'
-                                 and aff_key(t)==(Y, M))
+            mc_ce_mois = mc_depenses_reelles(M, Y) if cpt_id == 'ca' else 0.0
             sorties_tot = sorties + mc_ce_mois
             fin = (deb + entrees - sorties_tot) if deb is not None else None
             with st.expander(f"**{cpt['label']}**", expanded=True):
@@ -864,8 +894,7 @@ with tabs[1]:
     rev = sum(t['montant'] for t in TX_CUR if t['type']=='revenu')
     dep = sum(t['montant'] for t in TX_CUR if t['type']=='depense')
     # MC affectée à ce mois (tous comptes confondus dans le filtre courant, ou sur CA si filtre all)
-    mc_glob = sum(t['montant'] for t in D['tx']
-                  if t['compte']=='mc' and t['type']=='depense' and aff_key(t)==(Y, M))
+    mc_glob = mc_depenses_reelles(M, Y)
     dep_tot = dep + (mc_glob if FCPT in ('all','ca') else 0)
     k1,k2,k3,k4 = st.columns(4)
     k1.metric("Entrées", fmt(rev))
@@ -1137,9 +1166,8 @@ with tabs[5]:
                 entrees = sum(t['montant'] for t in tx_m if t['type']=='revenu')
                 sorties = sum(t['montant'] for t in tx_m if t['type']=='depense')
                 if cpt_id == 'ca':
-                    mc = sum(t['montant'] for t in D['tx']
-                             if t['compte']=='mc' and t['type']=='depense' and aff_key(t)==(y, m))
-                    sorties += mc
+                    sorties += mc_depenses_reelles(m, y)
+                sol_min = sol_max = None
                 sol_min = sol_max = None
             else:
                 fc = fc_list[fc_idx] if fc_idx < len(fc_list) else None
@@ -1507,8 +1535,7 @@ with tabs[8]:
         # Récurrentes fixes
         rec_dep_d = sum(r['mnt'] for r in D['rec']
                         if r['compte'] == diag_cpt and r['type'] == 'depense')
-        mc_rec_d  = sum(r['mnt'] for r in D['rec']
-                        if r['compte'] == 'mc' and r['type'] == 'depense') if diag_cpt == 'ca' else 0
+        mc_rec_d  = mc_rec_depenses() if diag_cpt == 'ca' else 0
         st.info(f"Récurrentes fixes = **{fmt(rec_dep_d + mc_rec_d)}** / mois "
                 f"({'CA: ' + fmt(rec_dep_d) + ' + MC rec: ' + fmt(mc_rec_d) if diag_cpt == 'ca' else fmt(rec_dep_d)})")
 

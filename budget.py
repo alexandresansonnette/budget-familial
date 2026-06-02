@@ -264,26 +264,26 @@ st.markdown("""
 # ── NAVIGATION ──────────────────────────────────────────────────────────────────
 nc1, nc2, nc3, nc4, nc5 = st.columns([1, 2, 1, 2, 2])
 with nc1:
-    if st.button("◀", use_container_width=True):
+    if st.button("◀", width="stretch"):
         if st.session_state.cur_m == 0: st.session_state.cur_m = 11; st.session_state.cur_y -= 1
         else: st.session_state.cur_m -= 1
         st.rerun()
 with nc2:
-    nm = st.selectbox("", range(12), index=st.session_state.cur_m,
+    nm = st.selectbox("Mois", range(12), index=st.session_state.cur_m,
                       format_func=lambda x: MOIS[x], label_visibility='collapsed')
     if nm != st.session_state.cur_m: st.session_state.cur_m = nm; st.rerun()
 with nc3:
-    if st.button("▶", use_container_width=True):
+    if st.button("▶", width="stretch"):
         if st.session_state.cur_m == 11: st.session_state.cur_m = 0; st.session_state.cur_y += 1
         else: st.session_state.cur_m += 1
         st.rerun()
 with nc4:
-    ny = st.selectbox("", range(2023, 2031), index=list(range(2023,2031)).index(st.session_state.cur_y),
+    ny = st.selectbox("Année", range(2023, 2031), index=list(range(2023,2031)).index(st.session_state.cur_y),
                       label_visibility='collapsed')
     if ny != st.session_state.cur_y: st.session_state.cur_y = ny; st.rerun()
 with nc5:
     fopts = {'all':'Tous les comptes', **{k: v['label'] for k,v in COMPTES.items()}}
-    nf = st.selectbox("", list(fopts.keys()), format_func=lambda x: fopts[x], label_visibility='collapsed')
+    nf = st.selectbox("Compte", list(fopts.keys()), format_func=lambda x: fopts[x], label_visibility='collapsed')
     if nf != st.session_state.fcpt: st.session_state.fcpt = nf; st.rerun()
 
 M, Y, FCPT = st.session_state.cur_m, st.session_state.cur_y, st.session_state.fcpt
@@ -362,7 +362,7 @@ with tabs[0]:
             'Compte': COMPTES[t['compte']]['label'].split()[0],
             'Description': t.get('note') or t['categorie'],
             'Montant': f"{'−' if t['type']=='depense' else '+'}{fmt2(t['montant'])}"
-        } for t in tx_now]), use_container_width=True, hide_index=True)
+        } for t in tx_now]), width="stretch", hide_index=True)
     else:
         st.info("Aucune transaction ce mois.")
 
@@ -408,7 +408,7 @@ with tabs[1]:
             fig = go.Figure(go.Bar(x=df_c['Cat'], y=df_c['Montant'], marker_color=CC[:len(df_c)],
                                    text=[fmt(v) for v in df_c['Montant']], textposition='outside'))
             fig.update_layout(height=300, margin=dict(t=20,b=80), showlegend=False, xaxis_tickangle=-30)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.info("Aucune dépense.")
     with g2:
@@ -420,7 +420,7 @@ with tabs[1]:
                 labels=[COMPTES[k]['label'] for k in dba], values=list(dba.values()),
                 marker_colors=[COMPTES[k]['color'] for k in dba], hole=0.4))
             fig2.update_layout(height=300, margin=dict(t=20,b=20))
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width="stretch")
         else:
             st.info("Aucune dépense.")
 
@@ -473,7 +473,7 @@ with tabs[2]:
                                                  key=f"tay_{t['id']}")
 
                     col_save, col_del = st.columns([3,1])
-                    if col_save.form_submit_button("💾 Enregistrer", use_container_width=True):
+                    if col_save.form_submit_button("💾 Enregistrer", width="stretch"):
                         idx = next(i for i,x in enumerate(D['tx']) if x['id']==t['id'])
                         D['tx'][idx] = {**t, 'date': new_date.strftime('%Y-%m-%d'),
                                         'compte': new_cpt, 'categorie': new_cat,
@@ -507,7 +507,7 @@ with tabs[3]:
             m1,m2 = st.columns(2)
             aff_m = m1.selectbox("Mois", range(12), index=datetime.now().month-1, format_func=lambda x: MOIS[x])
             aff_y = m2.selectbox("Année", [2024,2025,2026,2027], index=2)
-        if st.form_submit_button("✅ Ajouter", type="primary", use_container_width=True):
+        if st.form_submit_button("✅ Ajouter", type="primary", width="stretch"):
             new_tx = {'id':f"tx_{int(datetime.now().timestamp()*1000)}",
                       'date':tx_date.strftime('%Y-%m-%d'), 'compte':tx_cpt,
                       'categorie':tx_cat, 'montant':float(tx_mnt),
@@ -558,7 +558,7 @@ with tabs[4]:
                                         index=visible_cats().index(r['cat']) if r['cat'] in visible_cats() else 0)
                     rmnt = st.number_input("Montant €", value=float(r['mnt']), step=0.01, format="%.2f")
                     rjour = st.number_input("Jour du mois", value=min(int(r["jour"]), 28), min_value=1, max_value=28)
-                if st.form_submit_button("💾 Enregistrer", use_container_width=True):
+                if st.form_submit_button("💾 Enregistrer", width="stretch"):
                     idx = next(i for i,x in enumerate(D['rec']) if x['id']==r['id'])
                     D['rec'][idx] = {**r,'nom':rn,'compte':rc,'cat':rcat,'mnt':float(rmnt),'type':rt,'jour':int(rjour)}
                     persist(); st.success("✓"); st.rerun()
@@ -580,7 +580,7 @@ with tabs[4]:
             rcat2 = st.selectbox("Catégorie", visible_cats(), key="arcat")
             rmnt2 = st.number_input("Montant €", min_value=0.01, step=0.01, format="%.2f", key="armnt")
             rjour2 = st.number_input("Jour du mois", min_value=1, max_value=28, value=5, key="arjour")
-        if st.form_submit_button("✅ Enregistrer", use_container_width=True):
+        if st.form_submit_button("✅ Enregistrer", width="stretch"):
             D['rec'].append({'id':f"r_{int(datetime.now().timestamp()*1000)}",'nom':rn2,
                              'compte':rc2,'cat':rcat2,'mnt':float(rmnt2),'type':rt2,'jour':int(rjour2)})
             persist(); st.success("✓"); st.rerun()
@@ -612,13 +612,13 @@ with tabs[5]:
     fig.update_layout(height=400, hovermode='x unified', margin=dict(t=40,b=60,l=60,r=20),
                       legend=dict(orientation="h",yanchor="bottom",y=-0.25,xanchor="center",x=0.5),
                       yaxis_title="Solde (€)")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     df_fc = pd.DataFrame(
         {COMPTES[c]['label'].split()[0]: [f"{'~' if i>6 else ''}{round(series[c]['closes'][i])}" for i in range(12)]
          for c in ['ca','mb']},
         index=labels
     )
-    st.dataframe(df_fc, use_container_width=True)
+    st.dataframe(df_fc, width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PRÊTS
@@ -638,7 +638,7 @@ with tabs[6]:
                     pe = st.number_input("Mensualité €", value=float(p['ech']), step=10.0, format="%.2f")
                     pnb = st.number_input("Mensualités restantes", value=int(p['nb']), step=1)
                 st.progress(pct/100, text=f"{pct}% remboursé")
-                if st.form_submit_button("💾 Enregistrer", use_container_width=True):
+                if st.form_submit_button("💾 Enregistrer", width="stretch"):
                     idx = next(i for i,x in enumerate(D['prets']) if x['id']==p['id'])
                     D['prets'][idx] = {'id':p['id'],'nom':pn,'cap':float(pc),'ech':float(pe),'nb':int(pnb)}
                     persist(); st.success("✓"); st.rerun()
@@ -654,7 +654,7 @@ with tabs[6]:
         pcap = pp1.number_input("Capital restant €", min_value=0.0, step=100.0)
         pech = pp2.number_input("Mensualité €", min_value=0.0, step=10.0)
         pnb2 = pp2.number_input("Mensualités restantes", min_value=0, step=1)
-        if st.form_submit_button("✅ Enregistrer", use_container_width=True):
+        if st.form_submit_button("✅ Enregistrer", width="stretch"):
             D['prets'].append({'id':f"p_{int(datetime.now().timestamp()*1000)}",'nom':pnom,
                                'cap':float(pcap),'ech':float(pech),'nb':int(pnb2)})
             persist(); st.success("✓"); st.rerun()
@@ -702,7 +702,7 @@ with tabs[8]:
         st.download_button("⬇️ Télécharger JSON",
                            data=json.dumps(backup,ensure_ascii=False,indent=2),
                            file_name=f"budget_backup_{datetime.now().strftime('%Y-%m-%d')}.json",
-                           mime="application/json", use_container_width=True)
+                           mime="application/json", width="stretch")
         st.info(f"**{len(D['tx'])}** transactions · **{len(D['rec'])}** récurrentes · **{len(D['prets'])}** prêts")
     with bk2:
         st.markdown("**📤 Restaurer**")
@@ -711,7 +711,7 @@ with tabs[8]:
         if uploaded:
             try:
                 data_in = json.load(uploaded)
-                if st.button("🔄 Restaurer", type="primary", use_container_width=True):
+                if st.button("🔄 Restaurer", type="primary", width="stretch"):
                     if data_in.get('tx'): D['tx'] = data_in['tx']
                     if data_in.get('cats'):
                         cats_in = data_in['cats']
@@ -730,4 +730,4 @@ with tabs[8]:
         df_exp = pd.DataFrame([{'Date':t['date'],'Compte':t['compte'],'Catégorie':t['categorie'],
                                  'Type':t['type'],'Montant':t['montant'],'Note':t.get('note','')} for t in D['tx']])
         st.download_button("⬇️ Export CSV", data=df_exp.to_csv(index=False,encoding='utf-8-sig'),
-                           file_name="budget.csv", mime="text/csv", use_container_width=True)
+                           file_name="budget.csv", mime="text/csv", width="stretch")

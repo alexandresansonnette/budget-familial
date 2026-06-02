@@ -40,9 +40,11 @@ CC = ['#378ADD','#1D9E75','#D85A30','#D4537E','#7F77DD',
 
 # ── Helpers format ──────────────────────────────────────────────────────────────
 def fmt(n):
+    if n is None: return "—"
     return f"{n:,.0f} €".replace(",", " ")
 
 def fmt2(n):
+    if n is None: return "—"
     return f"{n:,.2f} €".replace(",", " ")
 
 def aff_key(t):

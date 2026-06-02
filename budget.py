@@ -633,7 +633,7 @@ TX_CUR = [t for t in tx_of_month(M, Y) if FCPT == 'all' or t['compte'] == FCPT]
 st.divider()
 
 tabs = st.tabs(["📍 Aujourd'hui","📊 Mois","📋 Transactions","✏️ Saisie",
-                "🔄 Récurrentes","📈 Prévisionnel","🏦 Prêts","🏷️ Catégories","💾 Sauvegarde"])
+                "🔄 Récurrentes","📈 Prévisionnel","🏦 Prêts","🏷️ Catégories","🔬 Diagnostic","💾 Sauvegarde"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AUJOURD'HUI
@@ -1260,7 +1260,152 @@ with tabs[7]:
 # ══════════════════════════════════════════════════════════════════════════════
 # SAUVEGARDE
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# DIAGNOSTIC PRÉVISION
+# ══════════════════════════════════════════════════════════════════════════════
 with tabs[8]:
+    st.subheader("🔬 Diagnostic — données utilisées par le modèle de prévision")
+    st.caption("Vérifie ici exactement ce que le modèle voit pour chaque catégorie avant de prévoir.")
+
+    diag_cpt = st.selectbox("Compte à analyser", ['ca', 'mb'],
+                             format_func=lambda x: COMPTES[x]['label'], key="diag_cpt")
+
+    now_d = datetime.now()
+    cm_d, cy_d = now_d.month - 1, now_d.year
+    CATS_EXCLUES_D = {'Virement interne', 'Épargne'}
+    rec_ids_d = {r['id'] for r in D['rec']}
+
+    # Reconstituer l'historique tel que vu par le modèle
+    hist_months_d = [month_add(cm_d, cy_d, -i) for i in range(1, 19)]
+    hist_months_d.reverse()
+
+    hist_d = defaultdict(list)
+    for m_h, y_h in hist_months_d:
+        abs_m = y_h * 12 + m_h
+        tx_m = [t for t in D['tx']
+                if t['compte'] == diag_cpt
+                and aff_key(t) == (y_h, m_h)
+                and t['type'] == 'depense'
+                and not t.get('recId')
+                and t.get('categorie') not in CATS_EXCLUES_D]
+        if diag_cpt == 'ca':
+            tx_m += [t for t in D['tx']
+                     if t['compte'] == 'mc'
+                     and t['type'] == 'depense'
+                     and not t.get('recId')
+                     and t.get('categorie') not in CATS_EXCLUES_D
+                     and aff_key(t) == (y_h, m_h)]
+        cat_totals = defaultdict(float)
+        for t in tx_m:
+            cat_totals[t['categorie']] += t['montant']
+        for cat, total in cat_totals.items():
+            hist_d[cat].append((f"{MOIS_COURT[m_h]} {y_h}", abs_m, round(total, 2)))
+
+    # ── Revenus utilisés ───────────────────────────────────────────────────
+    st.markdown("### Revenus estimés pour les mois futurs")
+    rec_rev_d = sum(r['mnt'] for r in D['rec']
+                    if r['compte'] == diag_cpt and r['type'] == 'revenu')
+    past_rev_d = []
+    for i in range(6):
+        pm2, py2 = month_add(cm_d, cy_d, -(i+1))
+        tx_rev = [t for t in D['tx']
+                  if t['compte'] == diag_cpt
+                  and aff_key(t) == (py2, pm2)
+                  and t['type'] == 'revenu'
+                  and not t.get('recId')
+                  and t.get('categorie') not in {'Virement interne'}]
+        if tx_rev:
+            total_rev = sum(t['montant'] for t in tx_rev)
+            past_rev_d.append((f"{MOIS_COURT[pm2]} {py2}", round(total_rev, 2)))
+
+    r1, r2, r3 = st.columns(3)
+    r1.metric("Récurrentes revenus (D['rec'])", fmt(rec_rev_d))
+    avg_rev_var_d = sum(v for _, v in past_rev_d) / len(past_rev_d) if past_rev_d else 0
+    r2.metric("Revenus variables moyens (6 mois)", fmt(avg_rev_var_d))
+    r3.metric("Total rev. estimé / mois", fmt(rec_rev_d + avg_rev_var_d))
+
+    if past_rev_d:
+        df_rev = pd.DataFrame(past_rev_d, columns=['Mois', 'Revenus variables'])
+        st.dataframe(df_rev.set_index('Mois'), width="stretch")
+    else:
+        st.warning("Aucun revenu variable détecté sur les 6 derniers mois.")
+
+    st.divider()
+
+    # ── Dépenses par catégorie ─────────────────────────────────────────────
+    st.markdown("### Dépenses variables par catégorie (après filtre IQR)")
+
+    if not hist_d:
+        st.info("Aucune donnée de dépense variable trouvée.")
+    else:
+        # Récurrentes fixes
+        rec_dep_d = sum(r['mnt'] for r in D['rec']
+                        if r['compte'] == diag_cpt and r['type'] == 'depense')
+        mc_rec_d  = sum(r['mnt'] for r in D['rec']
+                        if r['compte'] == 'mc' and r['type'] == 'depense') if diag_cpt == 'ca' else 0
+        st.info(f"Récurrentes fixes = **{fmt(rec_dep_d + mc_rec_d)}** / mois "
+                f"({'CA: ' + fmt(rec_dep_d) + ' + MC rec: ' + fmt(mc_rec_d) if diag_cpt == 'ca' else fmt(rec_dep_d)})")
+
+        summary_rows = []
+        for cat in sorted(hist_d.keys()):
+            data_raw = sorted(hist_d[cat], key=lambda x: x[1])
+            vals_raw = [v for _, _, v in data_raw]
+            n_raw = len(vals_raw)
+
+            # Filtre IQR
+            if n_raw >= 4:
+                q1, q3 = np.percentile(vals_raw, 25), np.percentile(vals_raw, 75)
+                iqr = q3 - q1
+                lo, hi = q1 - 1.5*iqr, q3 + 1.5*iqr
+                data_ok = [(lbl, a, v) for lbl, a, v in data_raw if lo <= v <= hi]
+                outliers = [(lbl, v) for lbl, _, v in data_raw if not (lo <= v <= hi)]
+            else:
+                data_ok = data_raw
+                outliers = []
+
+            vals_ok = [v for _, _, v in data_ok]
+            moyenne = round(float(np.mean(vals_ok)), 2) if vals_ok else 0
+            summary_rows.append({
+                'Catégorie': cat,
+                'Mois observés': n_raw,
+                'Après IQR': len(data_ok),
+                'Outliers exclus': len(outliers),
+                'Moyenne estimée': fmt(moyenne),
+                'Min obs.': fmt(min(vals_ok)) if vals_ok else "—",
+                'Max obs.': fmt(max(vals_ok)) if vals_ok else "—",
+                'Outliers (mois, montant)': ", ".join(f"{l}: {fmt(v)}" for l, v in outliers) if outliers else "—"
+            })
+
+        df_diag = pd.DataFrame(summary_rows).set_index('Catégorie')
+        st.dataframe(df_diag, width="stretch")
+
+        total_var = sum(float(r['Moyenne estimée'].replace(' ','').replace(' €','').replace('—','0')) 
+                        for r in summary_rows if r['Moyenne estimée'] != '—')
+        st.metric("Total variable estimé / mois", fmt(total_var))
+        st.metric("Total dépenses estimées / mois (variable + récurrentes)",
+                  fmt(total_var + rec_dep_d + mc_rec_d))
+        st.metric("Solde mensuel net estimé",
+                  fmt(rec_rev_d + avg_rev_var_d - total_var - rec_dep_d - mc_rec_d))
+
+        st.divider()
+        st.markdown("### Détail mensuel par catégorie (données brutes)")
+        cat_sel = st.selectbox("Catégorie", sorted(hist_d.keys()), key="diag_cat")
+        if cat_sel:
+            data_raw2 = sorted(hist_d[cat_sel], key=lambda x: x[1])
+            vals_raw2 = [v for _, _, v in data_raw2]
+            if len(vals_raw2) >= 4:
+                q1, q3 = np.percentile(vals_raw2, 25), np.percentile(vals_raw2, 75)
+                iqr = q3 - q1
+                lo2, hi2 = q1 - 1.5*iqr, q3 + 1.5*iqr
+            else:
+                lo2, hi2 = -1, float('inf')
+            rows_cat = []
+            for lbl, _, v in data_raw2:
+                flag = "⚠️ outlier exclu" if not (lo2 <= v <= hi2) else "✓ inclus"
+                rows_cat.append({'Mois': lbl, 'Montant': fmt(v), 'Statut IQR': flag})
+            st.dataframe(pd.DataFrame(rows_cat).set_index('Mois'), width="stretch")
+
+with tabs[9]:
     st.subheader("💾 Sauvegarde & Restauration")
     bk1,bk2 = st.columns(2)
     with bk1:

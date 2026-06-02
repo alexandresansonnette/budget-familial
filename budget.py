@@ -468,8 +468,9 @@ with tabs[0]:
     now = datetime.now()
     st.subheader(f"Situation au {now.strftime('%d/%m/%Y')}")
 
-    cols = st.columns(3)
-    for i, (cpt_id, cpt) in enumerate(COMPTES.items()):
+    cols = st.columns(2)
+    cpts_affich = [(k,v) for k,v in COMPTES.items() if k != 'mc']
+    for i, (cpt_id, cpt) in enumerate(cpts_affich):
         with cols[i]:
             solde = solde_a_date(cpt_id)
             od = D['overdraft'].get(cpt_id, 0)
@@ -538,8 +539,8 @@ with tabs[0]:
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[1]:
     st.subheader(f"{MOIS[M]} {Y}")
-    sol_cols = st.columns(3)
-    for i, (cpt_id, cpt) in enumerate(COMPTES.items()):
+    sol_cols = st.columns(2)
+    for i, (cpt_id, cpt) in [(k,v) for k,v in COMPTES.items() if k != 'mc']:
         with sol_cols[i]:
             deb = get_sol(cpt_id, M, Y)
             tx_m = tx_of_month(M, Y)

@@ -707,6 +707,90 @@ with tabs[0]:
                 D['overdraft'][cpt_id] = new_od; persist()
 
     st.markdown("---")
+
+    # ── Visuel besoin de trésorerie jusqu'à fin de mois ────────────────────
+    st.markdown("**💡 Besoin de trésorerie — fin de mois**")
+    now_m, now_y = now.month - 1, now.year
+    import calendar as _cal
+    last_day_now = _cal.monthrange(now_y, now_m + 1)[1]
+    days_left = last_day_now - now.day
+
+    tres_cols = st.columns(2)
+    for ti, (cpt_id, cpt) in enumerate([(k,v) for k,v in COMPTES.items() if k != 'mc']):
+        with tres_cols[ti]:
+            solde_now = solde_a_date(cpt_id)
+            od = D['overdraft'].get(cpt_id, 0)
+            if solde_now is None:
+                st.info(f"{cpt['label']} — solde non renseigné")
+                continue
+
+            # Récurrentes restantes
+            up_r = upcoming_rec(cpt_id)
+            rec_restant = sum(r['mnt'] if r['type']=='revenu' else -r['mnt'] for r in up_r)
+            # MC restante sur CA
+            mc_restant = 0.0
+            if cpt_id == 'ca':
+                # MC déjà passée ce mois (affectée au mois courant, date > aujourd'hui)
+                mc_restant = -sum(t['montant'] for t in D['tx']
+                                  if t['compte']=='mc' and t['type']=='depense'
+                                  and aff_key(t)==(now_y, now_m)
+                                  and datetime.strptime(t['date'],'%Y-%m-%d') > now)
+
+            solde_proj = solde_now + rec_restant + mc_restant
+            limite = -od
+            marge = solde_proj - limite
+
+            # Barre de progression : solde projeté vs limite découvert
+            color = cpt['color']
+            pct_used = max(0, min(100, int((limite - solde_proj) / max(1, abs(limite) + abs(solde_now)) * 100)))
+            if marge >= 500:
+                status_txt = f"✅ Marge : {fmt2(marge)}"
+                bar_color = "#1D9E75"
+            elif marge >= 0:
+                status_txt = f"⚠️ Marge faible : {fmt2(marge)}"
+                bar_color = "#D97706"
+            else:
+                status_txt = f"🔴 Dépassement : {fmt2(marge)}"
+                bar_color = "#E24B4A"
+
+            # Mini graphique Plotly waterfall simplifié
+            fig_t = go.Figure()
+            categories_t = ["Solde actuel"]
+            values_t = [solde_now]
+            colors_t = [color]
+            if rec_restant != 0:
+                categories_t.append("Prélèvements restants")
+                values_t.append(rec_restant)
+                colors_t.append("#1D9E75" if rec_restant > 0 else "#E24B4A")
+            if mc_restant != 0 and cpt_id == 'ca':
+                categories_t.append("MC restante")
+                values_t.append(mc_restant)
+                colors_t.append("#E24B4A")
+            categories_t.append("Solde fin estimé")
+            values_t.append(solde_proj)
+            colors_t.append(bar_color)
+
+            fig_t.add_trace(go.Bar(
+                x=categories_t, y=values_t,
+                marker_color=colors_t,
+                text=[fmt2(v) for v in values_t],
+                textposition='outside',
+                hovertemplate='%{x}<br>%{y:,.2f} €<extra></extra>'
+            ))
+            fig_t.add_hline(y=limite, line_dash="dash", line_color="#E24B4A",
+                            line_width=1.5, opacity=0.7,
+                            annotation_text=f"Limite ({fmt2(limite)})",
+                            annotation_position="bottom right")
+            fig_t.update_layout(
+                title=dict(text=f"{cpt['label']} — {days_left}j restants", font_size=13),
+                height=260, margin=dict(t=40, b=10, l=10, r=10),
+                showlegend=False, yaxis_title="€",
+                plot_bgcolor='rgba(0,0,0,0)'
+            )
+            st.plotly_chart(fig_t, width="stretch")
+            st.caption(status_txt)
+
+    st.markdown("---")
     st.markdown("**Dernières transactions du mois**")
     tx_now = sorted(tx_of_month(now.month-1, now.year), key=lambda t: t['date'], reverse=True)[:8]
     if tx_now:
@@ -806,10 +890,17 @@ with tabs[1]:
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[2]:
     st.subheader(f"Transactions — {MOIS[M]} {Y}")
-    cats_filt = ['Toutes'] + sorted(set(t['categorie'] for t in TX_CUR))
-    filt_cat = st.selectbox("Filtrer par catégorie", cats_filt)
+    tf1, tf2 = st.columns(2)
+    with tf1:
+        fopts_tx = {'all': 'Tous les comptes', **{k: v['label'] for k,v in COMPTES.items()}}
+        filt_cpt_tx = st.selectbox("Filtrer par compte", list(fopts_tx.keys()),
+                                    format_func=lambda x: fopts_tx[x], key="filt_cpt_tx")
+    with tf2:
+        tx_pool = [t for t in TX_CUR if filt_cpt_tx=='all' or t['compte']==filt_cpt_tx]
+        cats_filt = ['Toutes'] + sorted(set(t['categorie'] for t in tx_pool))
+        filt_cat = st.selectbox("Filtrer par catégorie", cats_filt, key="filt_cat_tx")
     tx_show = sorted(
-        TX_CUR if filt_cat=='Toutes' else [t for t in TX_CUR if t['categorie']==filt_cat],
+        tx_pool if filt_cat=='Toutes' else [t for t in tx_pool if t['categorie']==filt_cat],
         key=lambda t: t['date'], reverse=True
     )
     if not tx_show:

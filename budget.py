@@ -69,40 +69,44 @@ def get_gsheet_client():
     return gspread.authorize(creds)
 
 def load_from_gsheet():
-    """Charge toutes les données depuis Google Sheets (onglet 'data')."""
+    """Charge toutes les données depuis Google Sheets."""
     try:
         client = get_gsheet_client()
         sh = client.open(GSHEET_NAME)
         ws = sh.worksheet("data")
-        val = ws.acell('A1').value
-        if val:
-            return json.loads(val)
+
+        values = ws.col_values(1)
+        if values:
+            payload = "".join(values)
+            return json.loads(payload)
+
     except Exception as e:
         st.warning(f"Impossible de charger depuis Google Sheets : {e}")
+
     return get_default_data()
 
 def save_to_gsheet(data):
-    """Sauvegarde toutes les données dans Google Sheets (cellule A1 de l'onglet 'data')."""
+    """Sauvegarde les données en plusieurs cellules pour éviter l'erreur 413."""
     try:
         client = get_gsheet_client()
         sh = client.open(GSHEET_NAME)
+
         try:
             ws = sh.worksheet("data")
         except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title="data", rows=1, cols=1)
-        ws.update('A1', json.dumps(data, ensure_ascii=False))
+            ws = sh.add_worksheet(title="data", rows=2000, cols=2)
+
+        payload = json.dumps(data, ensure_ascii=False)
+        chunks = [payload[i:i+40000] for i in range(0, len(payload), 40000)]
+
+        ws.clear()
+        ws.update(
+            range_name=f"A1:A{len(chunks)}",
+            values=[[chunk] for chunk in chunks]
+        )
+
     except Exception as e:
         st.error(f"Erreur de sauvegarde : {e}")
-
-def get_default_data():
-    return {
-        'tx': [], 
-        'cats': [{'nom': c, 'visible': True} for c in CATS_DEFAULT],
-        'prets': [], 
-        'rec': [], 
-        'sol': {},
-        'overdraft': {'ca': 500, 'mc': 0, 'mb': 250}
-    }
 
 # ── Session state ───────────────────────────────────────────────────────────────
 if 'data' not in st.session_state:

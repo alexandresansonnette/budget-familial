@@ -1677,52 +1677,147 @@ with tabs[5]:
             )
             st.plotly_chart(fig_d, width="stretch")
 
-    # ══ TABLEAUX ET DÉTAIL CATÉGORIES ═════════════════════════════════════
-    with st.expander("Tableau mensuel", expanded=False):
-        for cpt_id in ['ca', 'mb']:
-            st.markdown(f"**{COMPTES[cpt_id]['label']}**")
-            rows_t = rows_ca if cpt_id == 'ca' else rows_mb
-            df_rows = []
-            for r in rows_t:
-                prefix = "~" if r['is_fc'] else ""
-                sol_str = "—"
-                if r['sol'] is not None:
-                    sol_str = f"{prefix}{round(r['sol']):,} €".replace(",", " ")
-                    if r['is_fc'] and r['sol_min'] is not None and r['sol_max'] is not None:
-                        sol_str += f" [{round(r['sol_min']):,}–{round(r['sol_max']):,}]".replace(",", " ")
-                df_rows.append({
-                    'Mois': r['label'],
-                    'Entrées': f"{prefix}+{round(r['entrees']):,} €".replace(",", " "),
-                    'Sorties': f"{prefix}−{round(r['sorties']):,} €".replace(",", " "),
-                    'Solde (IC)': sol_str
-                })
-            st.dataframe(pd.DataFrame(df_rows).set_index('Mois'), width="stretch")
+    # ══ DÉTAIL MENSUEL COMPLET ════════════════════════════════════════════
+    with st.expander("📋 Détail mensuel — entrées, sorties et catégories", expanded=False):
+        TENDANCE_ICON = {"hausse": "↑", "baisse": "↓", "stable": "→", "insuffisant": "?"}
 
-    with st.expander("Prévision détaillée par catégorie", expanded=False):
-        TENDANCE_ICON = {'hausse': '↑', 'baisse': '↓', 'stable': '→', 'insuffisant': '?'}
-        for cpt_id in ['ca', 'mb']:
-            st.markdown(f"**{COMPTES[cpt_id]['label']}**")
-            rows_c2 = rows_ca if cpt_id == 'ca' else rows_mb
-            rows_fc2 = [r for r in rows_c2 if r['is_fc'] and r['fc_detail']]
-            if not rows_fc2:
-                st.info("Pas encore de données suffisantes pour ce compte.")
-                continue
-            for r in rows_fc2:
-                ic = f"[{round(r['sol_min'] or 0):,} – {round(r['sol_max'] or 0):,} €]".replace(",", " ")
-                st.markdown(f"*{r['label']}* — sorties estimées **{round(r['sorties']):,} €** · Solde {ic}".replace(",", " "))
-                cat_data = []
-                for cat, d in sorted(r['fc_detail'].items(), key=lambda x: -x[1]['moyen']):
-                    if d['moyen'] < 1: continue
-                    icon = TENDANCE_ICON.get(d['tendance'], '?')
-                    cat_data.append({
-                        'Catégorie': f"{icon} {cat}",
-                        'Estimé': f"{round(d['moyen']):,} €".replace(",", " "),
-                        'Min': f"{round(d['min']):,} €".replace(",", " "),
-                        'Max': f"{round(d['max']):,} €".replace(",", " "),
-                        'Tendance': d['tendance']
-                    })
-                if cat_data:
-                    st.dataframe(pd.DataFrame(cat_data).set_index('Catégorie'), width="stretch")
+        detail_cpt = st.radio("Compte", ["ca", "mb"],
+                              format_func=lambda x: COMPTES[x]["label"],
+                              horizontal=True, key="detail_cpt_prev")
+        rows_detail = rows_ca if detail_cpt == "ca" else rows_mb
+
+        for r in rows_detail:
+            prefix = "~" if r["is_fc"] else ""
+            sol_str = fmt(r["sol"]) if r["sol"] is not None else "—"
+            if r["is_fc"] and r["sol_min"] is not None and r["sol_max"] is not None:
+                sol_str += f" [{fmt(r['sol_min'])} – {fmt(r['sol_max'])}]"
+
+            # Titre du mois avec badge passé/futur et solde
+            badge_color = "#888" if r["is_fc"] else "#1D9E75"
+            badge_txt   = f"{prefix}Estimé" if r["is_fc"] else "Réel"
+            solde_color = "#E24B4A" if (r["sol"] or 0) < 0 else "#1D9E75"
+
+            with st.expander(
+                f"{'~' if r['is_fc'] else '📅'} {r['label']} — "
+                f"Entrées {fmt(r['entrees'])} · Sorties {fmt(r['sorties'])} · "
+                f"Solde {sol_str}",
+                expanded=False
+            ):
+                col_e, col_s = st.columns(2)
+
+                # ── ENTRÉES ──────────────────────────────────────────────
+                with col_e:
+                    st.markdown("**💚 Entrées**")
+                    if not r["is_fc"]:
+                        # Passé : TX réelles
+                        tx_rev = [t for t in D["tx"]
+                                  if t["compte"] == detail_cpt
+                                  and aff_key(t) == (int(r["label"][-4:]), [MOIS_COURT.index(r["label"][:3])] and MOIS_COURT.index(r["label"][:3]))
+                                  and t["type"] == "revenu"]
+                        # Extraire l'année et le mois depuis le label
+                        lbl_parts = r["label"].split()
+                        lbl_m = MOIS_COURT.index(lbl_parts[0])
+                        lbl_y = int(lbl_parts[1])
+                        tx_rev = [t for t in D["tx"]
+                                  if t["compte"] == detail_cpt
+                                  and aff_key(t) == (lbl_y, lbl_m)
+                                  and t["type"] == "revenu"]
+                        by_cat = defaultdict(float)
+                        for t in tx_rev:
+                            by_cat[t["categorie"]] += t["montant"]
+                        if by_cat:
+                            for cat, mnt in sorted(by_cat.items(), key=lambda x: -x[1]):
+                                st.markdown(
+                                    f"<div style='display:flex;justify-content:space-between;"
+                                    f"padding:3px 0;border-bottom:1px solid #f0f0f0;font-size:13px'>"
+                                    f"<span>{cat}</span>"
+                                    f"<span style='color:#1D9E75;font-weight:500'>+{fmt(mnt)}</span></div>",
+                                    unsafe_allow_html=True
+                                )
+                        else:
+                            st.caption("Aucune entrée")
+                        st.markdown(f"**Total : +{fmt(r['entrees'])}**")
+                    else:
+                        # Futur : récurrentes revenus
+                        rec_rev = [(r2["nom"], r2["mnt"]) for r2 in D["rec"]
+                                   if r2["compte"] == detail_cpt and r2["type"] == "revenu"]
+                        for nom, mnt in sorted(rec_rev, key=lambda x: -x[1]):
+                            st.markdown(
+                                f"<div style='display:flex;justify-content:space-between;"
+                                f"padding:3px 0;border-bottom:1px solid #f0f0f0;font-size:13px'>"
+                                f"<span>🔄 {nom}</span>"
+                                f"<span style='color:#1D9E75;font-weight:500'>+{fmt(mnt)}</span></div>",
+                                unsafe_allow_html=True
+                            )
+                        if not rec_rev:
+                            st.caption("Aucune récurrente revenu")
+                        st.markdown(f"**Total estimé : +{fmt(r['entrees'])}**")
+
+                # ── SORTIES ───────────────────────────────────────────────
+                with col_s:
+                    st.markdown("**❤️ Sorties**")
+                    if not r["is_fc"]:
+                        lbl_parts = r["label"].split()
+                        lbl_m = MOIS_COURT.index(lbl_parts[0])
+                        lbl_y = int(lbl_parts[1])
+                        tx_dep = [t for t in D["tx"]
+                                  if t["compte"] == detail_cpt
+                                  and aff_key(t) == (lbl_y, lbl_m)
+                                  and t["type"] == "depense"]
+                        # Ajouter MC si CA
+                        if detail_cpt == "ca":
+                            tx_dep += [t for t in D["tx"]
+                                       if t["compte"] == "mc"
+                                       and t["type"] == "depense"
+                                       and aff_key(t) == (lbl_y, lbl_m)]
+                        by_cat = defaultdict(float)
+                        for t in tx_dep:
+                            by_cat[t["categorie"]] += t["montant"]
+                        if by_cat:
+                            for cat, mnt in sorted(by_cat.items(), key=lambda x: -x[1]):
+                                st.markdown(
+                                    f"<div style='display:flex;justify-content:space-between;"
+                                    f"padding:3px 0;border-bottom:1px solid #f0f0f0;font-size:13px'>"
+                                    f"<span>{cat}</span>"
+                                    f"<span style='color:#E24B4A;font-weight:500'>−{fmt(mnt)}</span></div>",
+                                    unsafe_allow_html=True
+                                )
+                        else:
+                            st.caption("Aucune sortie")
+                        st.markdown(f"**Total : −{fmt(r['sorties'])}**")
+                    else:
+                        # Futur : récurrentes dépenses + variable par catégorie
+                        rec_dep = [(r2["nom"], r2["mnt"], "rec") for r2 in D["rec"]
+                                   if r2["compte"] == detail_cpt and r2["type"] == "depense"]
+                        if detail_cpt == "ca":
+                            rec_dep += [(r2["nom"], r2["mnt"], "mc") for r2 in D["rec"]
+                                        if r2["compte"] == "mc" and r2["type"] == "depense"]
+                        for nom, mnt, src in sorted(rec_dep, key=lambda x: -x[1]):
+                            badge = "💳" if src == "mc" else "🔄"
+                            st.markdown(
+                                f"<div style='display:flex;justify-content:space-between;"
+                                f"padding:3px 0;border-bottom:1px solid #f0f0f0;font-size:13px'>"
+                                f"<span>{badge} {nom}</span>"
+                                f"<span style='color:#E24B4A;font-weight:500'>−{fmt(mnt)}</span></div>",
+                                unsafe_allow_html=True
+                            )
+                        # Dépenses variables estimées par catégorie
+                        if r["fc_detail"]:
+                            st.markdown("<div style='margin-top:8px;font-size:12px;color:#888'>Variables estimées :</div>",
+                                        unsafe_allow_html=True)
+                            for cat, d in sorted(r["fc_detail"].items(), key=lambda x: -x[1]["moyen"]):
+                                if d["moyen"] < 1: continue
+                                icon = TENDANCE_ICON.get(d["tendance"], "?")
+                                st.markdown(
+                                    f"<div style='display:flex;justify-content:space-between;"
+                                    f"padding:3px 0;border-bottom:1px solid #f5f5f5;font-size:12px;color:#555'>"
+                                    f"<span>{icon} {cat}</span>"
+                                    f"<span>−{fmt(d['moyen'])} "
+                                    f"<small style='color:#aaa'>[{fmt(d['min'])}–{fmt(d['max'])}]</small>"
+                                    f"</span></div>",
+                                    unsafe_allow_html=True
+                                )
+                        st.markdown(f"**Total estimé : −{fmt(r['sorties'])}**")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

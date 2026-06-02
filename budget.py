@@ -542,14 +542,33 @@ with tabs[1]:
     for i, (cpt_id, cpt) in enumerate(COMPTES.items()):
         with sol_cols[i]:
             deb = get_sol(cpt_id, M, Y)
-            mvt = sum(t['montant'] if t['type']=='revenu' else -t['montant']
-                      for t in tx_of_month(M,Y) if t['compte']==cpt_id)
-            fin = (deb+mvt) if deb is not None else None
+            tx_m = tx_of_month(M, Y)
+            entrees = sum(t['montant'] for t in tx_m if t['compte']==cpt_id and t['type']=='revenu')
+            sorties = sum(t['montant'] for t in tx_m if t['compte']==cpt_id and t['type']=='depense')
+            # Pour CA : ajouter les dépenses MC affectées à ce mois dans les sorties
+            mc_ce_mois = 0.0
+            if cpt_id == 'ca':
+                mc_ce_mois = sum(t['montant'] for t in D['tx']
+                                 if t['compte']=='mc' and t['type']=='depense'
+                                 and aff_key(t)==(Y, M))
+            sorties_tot = sorties + mc_ce_mois
+            fin = (deb + entrees - sorties_tot) if deb is not None else None
             with st.expander(f"**{cpt['label']}**", expanded=True):
-                c1,c2,c3 = st.columns(3)
-                c1.metric("Début", fmt2(deb))
-                c2.metric("Mouvement", f"{'+' if mvt>=0 else ''}{fmt2(mvt)}")
-                c3.metric("Fin", fmt2(fin))
+                if cpt_id == 'ca':
+                    c1,c2,c3,c4 = st.columns(4)
+                    c1.metric("Début", fmt2(deb))
+                    c2.metric("Entrées", f"+{fmt2(entrees)}", delta=None)
+                    c3.metric("Sorties CA+MC", f"−{fmt2(sorties_tot)}",
+                              help=f"CA direct : {fmt2(sorties)} · MC affectée : {fmt2(mc_ce_mois)}")
+                    c4.metric("Fin estimé", fmt2(fin))
+                    if mc_ce_mois > 0:
+                        st.caption(f"dont MC affectée à ce mois : **{fmt2(mc_ce_mois)}**")
+                else:
+                    c1,c2,c3,c4 = st.columns(4)
+                    c1.metric("Début", fmt2(deb))
+                    c2.metric("Entrées", f"+{fmt2(entrees)}")
+                    c3.metric("Sorties", f"−{fmt2(sorties)}")
+                    c4.metric("Fin estimé", fmt2(fin))
                 new_sol = st.number_input("Solde au 1er :", value=float(deb) if deb is not None else 0.0,
                                           step=10.0, key=f"sol_{cpt_id}_{M}_{Y}", format="%.2f")
                 if st.button("💾 Enregistrer", key=f"sav_{cpt_id}_{M}_{Y}"):
@@ -559,10 +578,15 @@ with tabs[1]:
     st.divider()
     rev = sum(t['montant'] for t in TX_CUR if t['type']=='revenu')
     dep = sum(t['montant'] for t in TX_CUR if t['type']=='depense')
-    k1,k2,k3 = st.columns(3)
-    k1.metric("Revenus", fmt(rev))
-    k2.metric("Dépenses", fmt(dep))
-    k3.metric("Variation", f"{'+' if rev-dep>=0 else ''}{fmt(rev-dep)}")
+    # MC affectée à ce mois (tous comptes confondus dans le filtre courant, ou sur CA si filtre all)
+    mc_glob = sum(t['montant'] for t in D['tx']
+                  if t['compte']=='mc' and t['type']=='depense' and aff_key(t)==(Y, M))
+    dep_tot = dep + (mc_glob if FCPT in ('all','ca') else 0)
+    k1,k2,k3,k4 = st.columns(4)
+    k1.metric("Entrées", fmt(rev))
+    k2.metric("Sorties directes", fmt(dep))
+    k3.metric("dont MC", fmt(mc_glob) if FCPT in ('all','ca') else "—")
+    k4.metric("Variation nette", f"{'+' if rev-dep_tot>=0 else ''}{fmt(rev-dep_tot)}")
     st.divider()
     g1,g2 = st.columns(2)
     with g1:
@@ -753,13 +777,13 @@ with tabs[4]:
             persist(); st.success("✓"); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PRÉVISIONNEL — refondu
+# PRÉVISIONNEL — barres entrées/sorties + ligne solde
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[5]:
     st.subheader("Prévisionnel — CA & Monabanq")
     st.caption(
-        "**Passé** : courbe journalière réelle · MC cumulée soustraite fin de mois d'affectation sur CA  |  "
-        "**Futur** : solde fin de mois estimé (récurrentes + moyenne TX passées)"
+        "**Passé** : entrées/sorties réelles par mois · MC intégrée dans CA  |  "
+        "**Futur** : estimé (récurrentes + moyenne TX passées) · pointillé"
     )
 
     months, daily_series, monthly_series, fc_warnings = build_forecast_v2()
@@ -767,112 +791,166 @@ with tabs[5]:
     for w in fc_warnings:
         st.warning(w)
 
-    now_str = datetime.now().strftime('%Y-%m-%d')
-    now_label = datetime.now().strftime('%d/%m/%Y')
+    now = datetime.now()
 
-    fig = go.Figure()
+    # ── Construire les données par mois pour chaque compte ─────────────────
+    def month_bars(cpt_id):
+        """
+        Retourne pour chaque mois une dict avec :
+          label, entrees, sorties (CA direct + MC si ca), solde_fin, is_fc
+        """
+        rows = []
+        for idx, (m, y) in enumerate(months):
+            rel = idx - 6
+            is_fc = rel > 0
+            label = f"{MOIS_COURT[m]} {y}"
 
-    # Zone rouge sous 0
-    all_vals = [v for s in monthly_series.values() for _, v, _ in s if v is not None]
-    y_min = min(all_vals) * 1.15 if all_vals else -1000
+            if not is_fc:
+                # Réel
+                tx_m = [t for t in D['tx'] if t['compte']==cpt_id and aff_key(t)==(y, m)]
+                entrees = sum(t['montant'] for t in tx_m if t['type']=='revenu')
+                sorties = sum(t['montant'] for t in tx_m if t['type']=='depense')
+                if cpt_id == 'ca':
+                    mc = sum(t['montant'] for t in D['tx']
+                             if t['compte']=='mc' and t['type']=='depense' and aff_key(t)==(y, m))
+                    sorties += mc
+            else:
+                # Prévisionnel : récurrentes + moyenne passée
+                rec_e = sum(r['mnt'] for r in D['rec'] if r['compte']==cpt_id and r['type']=='revenu')
+                rec_s = sum(r['mnt'] for r in D['rec'] if r['compte']==cpt_id and r['type']=='depense')
+                past_e, past_s = [], []
+                for i2 in range(6):
+                    pm2, py2 = months[i2]
+                    tx_p = [t for t in D['tx'] if t['compte']==cpt_id and aff_key(t)==(py2, pm2) and not t.get('recId')]
+                    if tx_p:
+                        past_e.append(sum(t['montant'] for t in tx_p if t['type']=='revenu'))
+                        past_s.append(sum(t['montant'] for t in tx_p if t['type']=='depense'))
+                avg_e = sum(past_e)/len(past_e) if past_e else 0.0
+                avg_s = sum(past_s)/len(past_s) if past_s else 0.0
+                entrees = rec_e + avg_e
+                sorties = rec_s + avg_s
+                if cpt_id == 'ca':
+                    mc_rec = sum(r['mnt'] for r in D['rec'] if r['compte']=='mc' and r['type']=='depense')
+                    sorties += mc_rec
 
-    fig.add_hrect(y0=y_min, y1=0, fillcolor="rgba(220,50,50,0.04)", line_width=0)
+            # Solde fin depuis monthly_series
+            sol_fin = next((v for lbl,v,fc in monthly_series[cpt_id] if lbl==label), None)
+            rows.append({'label':label,'entrees':entrees,'sorties':sorties,'sol':sol_fin,'is_fc':is_fc})
+        return rows
 
+    # ── Graphique pour chaque compte ───────────────────────────────────────
     for cpt_id in ['ca', 'mb']:
         cpt = COMPTES[cpt_id]
-        color = cpt['color']
-        r_int = int(color[1:3], 16)
-        g_int = int(color[3:5], 16)
-        b_int = int(color[5:7], 16)
+        color_sol = cpt['color']
+        rows = month_bars(cpt_id)
 
-        # ── Courbe journalière passé ────────────────────────────────────────
-        daily_pts = daily_series[cpt_id]
-        if daily_pts:
-            dates_past = [dp[0] for dp in daily_pts if dp[0] <= now_str]
-            vals_past  = [dp[1] for dp in daily_pts if dp[0] <= now_str]
-            if dates_past:
-                fig.add_trace(go.Scatter(
-                    x=dates_past, y=vals_past,
-                    mode='lines',
-                    name=cpt['label'],
-                    line=dict(color=color, width=2),
-                    fill='tozeroy',
-                    fillcolor=f"rgba({r_int},{g_int},{b_int},0.07)",
-                    hovertemplate='%{x}<br>%{y:,.0f} €<extra>' + cpt['label'] + '</extra>'
-                ))
+        labels    = [r['label'] for r in rows]
+        entrees   = [r['entrees'] for r in rows]
+        sorties   = [r['sorties'] for r in rows]
+        sols      = [r['sol'] for r in rows]
+        is_fc     = [r['is_fc'] for r in rows]
 
-            # Projection mois courant (pointillé léger)
-            dates_proj = [dp[0] for dp in daily_pts if dp[0] >= now_str]
-            vals_proj  = [dp[1] for dp in daily_pts if dp[0] >= now_str]
-            if dates_proj:
-                fig.add_trace(go.Scatter(
-                    x=dates_proj, y=vals_proj,
-                    mode='lines',
-                    name=f"{cpt['label']} (projection mois courant)",
-                    showlegend=False,
-                    line=dict(color=color, width=1.5, dash='dot'),
-                    hovertemplate='%{x}<br>%{y:,.0f} €<extra>Projection</extra>'
-                ))
+        # Opacité : passé=1, futur=0.45
+        op_in  = [0.45 if f else 1.0 for f in is_fc]
+        op_out = [0.45 if f else 1.0 for f in is_fc]
 
-        # ── Points mensuels futurs ──────────────────────────────────────────
-        fc_pts = [(label, val) for label, val, is_fc in monthly_series[cpt_id] if is_fc and val is not None]
-        # Ajouter le dernier point réel comme ancrage
-        real_pts = [(label, val) for label, val, is_fc in monthly_series[cpt_id] if not is_fc and val is not None]
-        anchor = [real_pts[-1]] if real_pts else []
-        fc_with_anchor = anchor + fc_pts
-        if len(fc_with_anchor) > 1:
+        fig = go.Figure()
+
+        # Zone rouge sous 0
+        sol_vals = [s for s in sols if s is not None]
+        y_min_s = min(sol_vals)*1.15 if sol_vals else -500
+        fig.add_hrect(y0=y_min_s, y1=0, fillcolor="rgba(220,50,50,0.05)", line_width=0)
+
+        # Barres entrées (vert)
+        fig.add_trace(go.Bar(
+            x=labels, y=entrees,
+            name="Entrées",
+            marker_color=[f"rgba(29,158,117,{o})" for o in op_in],
+            offsetgroup=0,
+            hovertemplate='%{x}<br>Entrées : %{y:,.0f} €<extra></extra>'
+        ))
+
+        # Barres sorties (rouge, vers le bas)
+        fig.add_trace(go.Bar(
+            x=labels, y=[-s for s in sorties],
+            name="Sorties",
+            marker_color=[f"rgba(226,75,74,{o})" for o in op_out],
+            offsetgroup=1,
+            hovertemplate='%{x}<br>Sorties : %{customdata:,.0f} €<extra></extra>',
+            customdata=sorties
+        ))
+
+        # Ligne de solde
+        fig.add_trace(go.Scatter(
+            x=[labels[i] for i,v in enumerate(sols) if v is not None and not is_fc[i]],
+            y=[v for i,v in enumerate(sols) if v is not None and not is_fc[i]],
+            mode='lines+markers',
+            name=f"Solde {cpt['label'].split()[0]}",
+            line=dict(color=color_sol, width=2.5),
+            marker=dict(size=6),
+            hovertemplate='%{x}<br>Solde : %{y:,.0f} €<extra></extra>'
+        ))
+        # Ligne solde futur (pointillé)
+        # Ancrage : dernier point réel
+        real_sols = [(i,v) for i,v in enumerate(sols) if v is not None and not is_fc[i]]
+        fc_sols   = [(i,v) for i,v in enumerate(sols) if v is not None and is_fc[i]]
+        if real_sols and fc_sols:
+            anchor_i, anchor_v = real_sols[-1]
+            x_fc = [labels[anchor_i]] + [labels[i] for i,v in fc_sols]
+            y_fc = [anchor_v] + [v for i,v in fc_sols]
             fig.add_trace(go.Scatter(
-                x=[p[0] for p in fc_with_anchor],
-                y=[p[1] for p in fc_with_anchor],
+                x=x_fc, y=y_fc,
                 mode='lines+markers',
-                name=f"{cpt['label']} (prévisionnel)",
+                name=f"Solde prévu",
                 showlegend=False,
-                line=dict(color=color, width=1.5, dash='dot'),
-                marker=dict(size=7, symbol='circle-open'),
-                hovertemplate='%{x}<br>%{y:,.0f} €<extra>Prévisionnel</extra>'
+                line=dict(color=color_sol, width=1.5, dash='dot'),
+                marker=dict(size=6, symbol='circle-open'),
+                hovertemplate='%{x}<br>Solde estimé : %{y:,.0f} €<extra></extra>'
             ))
 
         # Ligne découvert
         od_val = D['overdraft'].get(cpt_id, 0)
         if od_val > 0:
-            fig.add_hline(
-                y=-od_val,
-                line_dash="dash", line_color=color, line_width=1, opacity=0.5,
-                annotation_text=f"Découvert {cpt['label'].split()[0]}",
-                annotation_position="bottom right"
+            fig.add_hline(y=-od_val, line_dash="dash", line_color=color_sol,
+                          line_width=1, opacity=0.4,
+                          annotation_text=f"Découvert max", annotation_position="bottom right")
+
+        # Ligne verticale aujourd'hui
+        today_label = f"{MOIS_COURT[now.month-1]} {now.year}"
+        if today_label in labels:
+            fig.add_vline(
+                x=today_label,
+                line_dash="dot", line_color="gray", line_width=1.5
             )
 
-    # Ligne verticale aujourd'hui
-    fig.add_vline(
-        x=datetime.now().timestamp() * 1000,
-        line_dash="dot", line_color="gray", line_width=1.5,
-        annotation_text="Aujourd'hui", annotation_position="top right"
-    )
+        fig.update_layout(
+            title=dict(text=cpt['label'], font=dict(size=14)),
+            barmode='group',
+            height=320,
+            hovermode='x unified',
+            margin=dict(t=40, b=50, l=50, r=20),
+            legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
+            yaxis_title="€",
+            bargap=0.2,
+            bargroupgap=0.05
+        )
+        st.plotly_chart(fig, width="stretch")
 
-    fig.update_layout(
-        height=430,
-        hovermode='x unified',
-        margin=dict(t=40, b=60, l=60, r=20),
-        legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
-        yaxis_title="Solde (€)",
-        xaxis_title="",
-    )
-    st.plotly_chart(fig, width="stretch")
-
-    # ── Tableau récapitulatif ───────────────────────────────────────────────
-    st.markdown("**Tableau mensuel**")
-    table_rows = {}
-    for cpt_id in ['ca', 'mb']:
-        label_cpt = COMPTES[cpt_id]['label'].split()[0]
-        table_rows[label_cpt] = []
-        for lbl, val, is_fc in monthly_series[cpt_id]:
-            prefix = "~" if is_fc else ""
-            cell = f"{prefix}{round(val):,} €".replace(",", "\u202f") if val is not None else "—"
-            table_rows[label_cpt].append(cell)
-
-    col_labels = [lbl for lbl, _, _ in monthly_series['ca']]
-    df_fc = pd.DataFrame(table_rows, index=col_labels)
-    st.dataframe(df_fc, width="stretch")
+    # ── Tableau récap ───────────────────────────────────────────────────────
+    with st.expander("Tableau mensuel détaillé", expanded=False):
+        for cpt_id in ['ca', 'mb']:
+            st.markdown(f"**{COMPTES[cpt_id]['label']}**")
+            rows = month_bars(cpt_id)
+            df_rows = []
+            for r in rows:
+                prefix = "~" if r['is_fc'] else ""
+                df_rows.append({
+                    'Mois': r['label'],
+                    'Entrées': f"{prefix}+{round(r['entrees']):,} €".replace(","," "),
+                    'Sorties': f"{prefix}−{round(r['sorties']):,} €".replace(","," "),
+                    'Solde fin': f"{prefix}{round(r['sol']):,} €".replace(","," ") if r['sol'] is not None else "—"
+                })
+            st.dataframe(pd.DataFrame(df_rows).set_index('Mois'), width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PRÊTS

@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 import json
 import gspread
 import calendar
+import numpy as np
 from google.oauth2.service_account import Credentials
 from datetime import datetime, date
 from collections import defaultdict
@@ -265,6 +266,173 @@ def resolve_sol(cpt_id, target_m, target_y):
     return sol, 'calculé'
 
 
+def prevision_depenses(cpt_id, mois_cibles):
+    """
+    Modèle de prévision des dépenses variables par catégorie.
+    Combine tendance linéaire + moyenne pondérée exponentielle + saisonnalité.
+    Les poids s'ajustent selon la quantité d'historique disponible.
+
+    Paramètres :
+      cpt_id       : 'ca' ou 'mb'
+      mois_cibles  : liste de (m, y) 0-indexed pour lesquels prévoir
+
+    Retourne :
+      {
+        'total_moyen': float,
+        'total_min': float,
+        'total_max': float,
+        'par_categorie': { cat: {'moyen':float,'min':float,'max':float,'tendance':str} }
+      }
+      pour chaque mois cible : liste de dicts dans le même ordre que mois_cibles
+    """
+    now = datetime.now()
+    cm, cy = now.month - 1, now.year
+
+    # ── Collecter tout l'historique mensuel par catégorie ─────────────────────
+    # On remonte jusqu'à 18 mois pour avoir de la saisonnalité
+    hist_months = [month_add(cm, cy, -i) for i in range(1, 19)]
+    hist_months.reverse()  # ordre chronologique
+
+    # Identifiants des récurrentes connues → exclus des dépenses variables
+    rec_ids = {r['id'] for r in D['rec']}
+    rec_cats_fixes = {r['cat'] for r in D['rec'] if r['compte'] == cpt_id}
+
+    # Historique : { cat: [(abs_month, montant), ...] }
+    hist = defaultdict(list)
+    for m, y in hist_months:
+        abs_m = y * 12 + m
+        tx_m = [t for t in D['tx']
+                if t['compte'] == cpt_id
+                and aff_key(t) == (y, m)
+                and t['type'] == 'depense'
+                and not t.get('recId')]
+        # Pour CA inclure aussi MC affectée
+        if cpt_id == 'ca':
+            tx_m += [t for t in D['tx']
+                     if t['compte'] == 'mc'
+                     and t['type'] == 'depense'
+                     and aff_key(t) == (y, m)]
+        cat_totals = defaultdict(float)
+        for t in tx_m:
+            cat_totals[t['categorie']] += t['montant']
+        for cat, total in cat_totals.items():
+            hist[cat].append((abs_m, total))
+
+    # ── Fonction de prévision pour une catégorie ──────────────────────────────
+    def predict_cat(cat, target_m, target_y):
+        data = sorted(hist.get(cat, []), key=lambda x: x[0])
+        n = len(data)
+        target_abs = target_y * 12 + target_m
+
+        if n == 0:
+            return 0.0, 0.0, 0.0
+
+        vals = np.array([v for _, v in data])
+        abs_months = np.array([a for a, _ in data])
+
+        # ── Composante 1 : moyenne pondérée exponentielle (toujours active) ──
+        # Decay : mois récent pèse e^0 = 1, il y a 6 mois e^(-0.3*6) ≈ 0.16
+        decay = 0.25
+        weights = np.exp(-decay * (target_abs - abs_months))
+        weights = np.maximum(weights, 1e-6)
+        ewm = float(np.average(vals, weights=weights))
+
+        # ── Composante 2 : tendance linéaire (active si n >= 3) ──────────────
+        if n >= 3:
+            x = abs_months - abs_months.mean()
+            slope = float(np.polyfit(x, vals, 1)[0])
+            # Projection de la tendance sur le mois cible
+            x_target = target_abs - abs_months.mean()
+            trend_val = float(np.polyval(np.polyfit(x, vals, 1), x_target))
+            trend_val = max(0.0, trend_val)
+            # Poids tendance : monte de 0 à 0.4 entre 3 et 10 obs
+            w_trend = min(0.4, (n - 2) / 8 * 0.4)
+        else:
+            trend_val = ewm
+            w_trend = 0.0
+            slope = 0.0
+
+        # ── Composante 3 : saisonnalité (active si >= 2 obs du même mois) ────
+        same_month = [(a, v) for a, v in data if a % 12 == target_m]
+        if len(same_month) >= 2:
+            sm_vals = np.array([v for _, v in same_month])
+            overall_mean = vals.mean() if vals.mean() > 0 else 1.0
+            seasonal_ratio = sm_vals.mean() / overall_mean
+            # Poids saisonnalité : monte de 0 à 0.3 avec les données disponibles
+            w_seasonal = min(0.3, len(same_month) / 4 * 0.3)
+            seasonal_contrib = seasonal_ratio
+        else:
+            w_seasonal = 0.0
+            seasonal_contrib = 1.0
+
+        # ── Combinaison ───────────────────────────────────────────────────────
+        w_ewm = 1.0 - w_trend - w_seasonal
+        if w_seasonal > 0:
+            pred = w_ewm * ewm + w_trend * trend_val + w_seasonal * (ewm * seasonal_contrib)
+        else:
+            pred = w_ewm * ewm + w_trend * trend_val
+        pred = max(0.0, pred)
+
+        # ── Intervalle de confiance : écart-type résiduel ─────────────────────
+        if n >= 2:
+            residuals = vals - np.mean(vals)
+            std = float(np.std(residuals))
+            # IC à ~80% : ±1.28σ, réduit si peu de données
+            ic_factor = min(1.28, 0.5 + n * 0.1)
+            margin = std * ic_factor
+        else:
+            margin = pred * 0.3  # ±30% par défaut
+
+        return pred, max(0.0, pred - margin), pred + margin
+
+    # ── Prévision pour chaque mois cible ─────────────────────────────────────
+    all_cats = sorted(hist.keys())
+    results = []
+
+    for target_m, target_y in mois_cibles:
+        par_cat = {}
+        for cat in all_cats:
+            moyen, lo, hi = predict_cat(cat, target_m, target_y)
+            # Tendance qualitative
+            data = sorted(hist.get(cat, []), key=lambda x: x[0])
+            if len(data) >= 3:
+                recent = np.mean([v for _, v in data[-3:]])
+                older  = np.mean([v for _, v in data[:max(1, len(data)-3)]])
+                if recent > older * 1.1:
+                    tendance = "hausse"
+                elif recent < older * 0.9:
+                    tendance = "baisse"
+                else:
+                    tendance = "stable"
+            else:
+                tendance = "insuffisant"
+            par_cat[cat] = {'moyen': moyen, 'min': lo, 'max': hi, 'tendance': tendance}
+
+        total_moyen = sum(v['moyen'] for v in par_cat.values())
+        total_min   = sum(v['min']   for v in par_cat.values())
+        total_max   = sum(v['max']   for v in par_cat.values())
+
+        # Ajouter récurrentes (montant fixe, pas d'incertitude)
+        rec_total = sum(r['mnt'] for r in D['rec']
+                        if r['compte'] == cpt_id and r['type'] == 'depense')
+        if cpt_id == 'ca':
+            rec_total += sum(r['mnt'] for r in D['rec']
+                             if r['compte'] == 'mc' and r['type'] == 'depense')
+
+        results.append({
+            'variable_moyen': total_moyen,
+            'variable_min': total_min,
+            'variable_max': total_max,
+            'recurrentes': rec_total,
+            'total_moyen': total_moyen + rec_total,
+            'total_min':   total_min   + rec_total,
+            'total_max':   total_max   + rec_total,
+            'par_categorie': par_cat
+        })
+
+    return results
+
+
 def build_forecast_v2():
     """
     Prévisionnel refondu.
@@ -366,27 +534,15 @@ def build_forecast_v2():
         daily_series[cpt_id] = daily_pts
 
         # ── Points mensuels (12 mois) ──────────────────────────────────────
-        # Moyenne TX non-récurrentes sur les 6 derniers mois passés
-        past_nets = []
-        for i in range(6):
-            pm2, py2 = months[i]
-            non_rec = [t for t in D['tx']
-                       if t['compte'] == cpt_id
-                       and aff_key(t) == (py2, pm2)
-                       and not t.get('recId')]
-            if non_rec:
-                net = sum(t['montant'] if t['type'] == 'revenu' else -t['montant']
-                          for t in non_rec)
-                past_nets.append(net)
-        avg_non_rec = sum(past_nets) / len(past_nets) if past_nets else 0.0
+        # Futur : prévision par catégorie avec modèle combiné
+        future_months = [(m, y) for m, y in months[7:]]  # +1 à +5
+        fc_results = prevision_depenses(cpt_id, future_months) if future_months else []
 
-        rec_net = sum(r['mnt'] if r['type'] == 'revenu' else -r['mnt']
-                      for r in D['rec'] if r['compte'] == cpt_id)
-        mc_rec_monthly = sum(r['mnt'] for r in D['rec']
-                             if r['compte'] == 'mc' and r['type'] == 'depense') \
-                         if cpt_id == 'ca' else 0.0
+        rec_net_rev = sum(r['mnt'] for r in D['rec']
+                          if r['compte'] == cpt_id and r['type'] == 'revenu')
 
         monthly_pts = []
+        fc_idx = 0
         for idx in range(12):
             m, y = months[idx]
             rel = idx - 6
@@ -397,17 +553,30 @@ def build_forecast_v2():
                 prefix = f"{y}-{m+1:02d}-"
                 pts_m = [(ds, sv) for ds, sv in daily_series[cpt_id] if ds.startswith(prefix)]
                 val = pts_m[-1][1] if pts_m else None
+                val_min = val_max = val
                 is_fc = False
             else:
-                # Futur
-                prev_val = monthly_pts[-1][1] if monthly_pts else None
+                # Futur : modèle combiné
+                prev_val = monthly_pts[-1][0] if monthly_pts else None
                 if prev_val is None:
-                    val = None
+                    val = val_min = val_max = None
                 else:
-                    val = prev_val + rec_net + avg_non_rec - mc_rec_monthly
+                    fc = fc_results[fc_idx] if fc_idx < len(fc_results) else None
+                    if fc:
+                        dep_moyen = fc['total_moyen']
+                        dep_min   = fc['total_min']
+                        dep_max   = fc['total_max']
+                    else:
+                        dep_moyen = dep_min = dep_max = 0.0
+                    val     = prev_val + rec_net_rev - dep_moyen
+                    val_min = prev_val + rec_net_rev - dep_max   # sorties max → solde min
+                    val_max = prev_val + rec_net_rev - dep_min   # sorties min → solde max
+                fc_idx += 1
                 is_fc = True
 
-            monthly_pts.append((label, val, is_fc))
+            monthly_pts.append((val, val_min, val_max, label, is_fc))
+
+        monthly_series[cpt_id] = monthly_pts
 
         monthly_series[cpt_id] = monthly_pts
 
@@ -795,19 +964,26 @@ with tabs[5]:
     now = datetime.now()
 
     # ── Construire les données par mois pour chaque compte ─────────────────
+    # Prévision par catégorie pour les mois futurs (partagée entre comptes)
+    future_months_list = [months[i] for i in range(7, 12)]
+    fc_by_cpt = {cpt_id: prevision_depenses(cpt_id, future_months_list)
+                 for cpt_id in ['ca', 'mb']}
+
     def month_bars(cpt_id):
         """
-        Retourne pour chaque mois une dict avec :
-          label, entrees, sorties (CA direct + MC si ca), solde_fin, is_fc
+        Retourne pour chaque mois une dict :
+          label, entrees, sorties, sol, sol_min, sol_max, is_fc, fc_detail
         """
         rows = []
+        fc_list = fc_by_cpt[cpt_id]
+        fc_idx = 0
         for idx, (m, y) in enumerate(months):
             rel = idx - 6
             is_fc = rel > 0
             label = f"{MOIS_COURT[m]} {y}"
+            fc_detail = None
 
             if not is_fc:
-                # Réel
                 tx_m = [t for t in D['tx'] if t['compte']==cpt_id and aff_key(t)==(y, m)]
                 entrees = sum(t['montant'] for t in tx_m if t['type']=='revenu')
                 sorties = sum(t['montant'] for t in tx_m if t['type']=='depense')
@@ -815,28 +991,35 @@ with tabs[5]:
                     mc = sum(t['montant'] for t in D['tx']
                              if t['compte']=='mc' and t['type']=='depense' and aff_key(t)==(y, m))
                     sorties += mc
+                sol_min = sol_max = None
             else:
-                # Prévisionnel : récurrentes + moyenne passée
+                fc = fc_list[fc_idx] if fc_idx < len(fc_list) else None
+                fc_idx += 1
                 rec_e = sum(r['mnt'] for r in D['rec'] if r['compte']==cpt_id and r['type']=='revenu')
-                rec_s = sum(r['mnt'] for r in D['rec'] if r['compte']==cpt_id and r['type']=='depense')
-                past_e, past_s = [], []
-                for i2 in range(6):
-                    pm2, py2 = months[i2]
-                    tx_p = [t for t in D['tx'] if t['compte']==cpt_id and aff_key(t)==(py2, pm2) and not t.get('recId')]
-                    if tx_p:
-                        past_e.append(sum(t['montant'] for t in tx_p if t['type']=='revenu'))
-                        past_s.append(sum(t['montant'] for t in tx_p if t['type']=='depense'))
-                avg_e = sum(past_e)/len(past_e) if past_e else 0.0
-                avg_s = sum(past_s)/len(past_s) if past_s else 0.0
-                entrees = rec_e + avg_e
-                sorties = rec_s + avg_s
-                if cpt_id == 'ca':
-                    mc_rec = sum(r['mnt'] for r in D['rec'] if r['compte']=='mc' and r['type']=='depense')
-                    sorties += mc_rec
+                if fc:
+                    entrees = rec_e
+                    sorties = fc['total_moyen']
+                    sol_min_dep = fc['total_max']
+                    sol_max_dep = fc['total_min']
+                    fc_detail = fc['par_categorie']
+                else:
+                    entrees = rec_e
+                    sorties = 0.0
+                    sol_min_dep = sol_max_dep = 0.0
+                sol_min = sol_max = None  # calculé depuis monthly_series
 
-            # Solde fin depuis monthly_series
-            sol_fin = next((v for lbl,v,fc in monthly_series[cpt_id] if lbl==label), None)
-            rows.append({'label':label,'entrees':entrees,'sorties':sorties,'sol':sol_fin,'is_fc':is_fc})
+            # Solde depuis monthly_series (nouveau format)
+            ms_entry = next(((v,vmi,vma) for v,vmi,vma,lbl,ifc in monthly_series[cpt_id] if lbl==label), (None,None,None))
+            sol_fin, sol_min_s, sol_max_s = ms_entry
+            if is_fc:
+                sol_min = sol_min_s
+                sol_max = sol_max_s
+
+            rows.append({
+                'label': label, 'entrees': entrees, 'sorties': sorties,
+                'sol': sol_fin, 'sol_min': sol_min, 'sol_max': sol_max,
+                'is_fc': is_fc, 'fc_detail': fc_detail
+            })
         return rows
 
     # ── Graphique pour chaque compte ───────────────────────────────────────
@@ -881,7 +1064,7 @@ with tabs[5]:
             customdata=sorties
         ))
 
-        # Ligne de solde
+        # Ligne de solde passé
         fig.add_trace(go.Scatter(
             x=[labels[i] for i,v in enumerate(sols) if v is not None and not is_fc[i]],
             y=[v for i,v in enumerate(sols) if v is not None and not is_fc[i]],
@@ -891,14 +1074,32 @@ with tabs[5]:
             marker=dict(size=6),
             hovertemplate='%{x}<br>Solde : %{y:,.0f} €<extra></extra>'
         ))
-        # Ligne solde futur (pointillé)
-        # Ancrage : dernier point réel
+        # Solde futur + intervalle de confiance
         real_sols = [(i,v) for i,v in enumerate(sols) if v is not None and not is_fc[i]]
         fc_sols   = [(i,v) for i,v in enumerate(sols) if v is not None and is_fc[i]]
+        sol_mins  = [rows[i]['sol_min'] for i,v in enumerate(sols) if v is not None and is_fc[i]]
+        sol_maxs  = [rows[i]['sol_max'] for i,v in enumerate(sols) if v is not None and is_fc[i]]
         if real_sols and fc_sols:
             anchor_i, anchor_v = real_sols[-1]
             x_fc = [labels[anchor_i]] + [labels[i] for i,v in fc_sols]
             y_fc = [anchor_v] + [v for i,v in fc_sols]
+            y_lo = [anchor_v] + [v if v is not None else y_fc[j+1] for j,v in enumerate(sol_mins)]
+            y_hi = [anchor_v] + [v if v is not None else y_fc[j+1] for j,v in enumerate(sol_maxs)]
+            r_int = int(color_sol[1:3], 16)
+            g_int = int(color_sol[3:5], 16)
+            b_int = int(color_sol[5:7], 16)
+            # Zone IC
+            fig.add_trace(go.Scatter(
+                x=x_fc + x_fc[::-1],
+                y=y_hi + y_lo[::-1],
+                fill='toself',
+                fillcolor=f"rgba({r_int},{g_int},{b_int},0.12)",
+                line=dict(width=0),
+                showlegend=False,
+                hoverinfo='skip',
+                name='IC'
+            ))
+            # Ligne centrale pointillée
             fig.add_trace(go.Scatter(
                 x=x_fc, y=y_fc,
                 mode='lines+markers',
@@ -906,7 +1107,7 @@ with tabs[5]:
                 showlegend=False,
                 line=dict(color=color_sol, width=1.5, dash='dot'),
                 marker=dict(size=6, symbol='circle-open'),
-                hovertemplate='%{x}<br>Solde estimé : %{y:,.0f} €<extra></extra>'
+                hovertemplate='%{x}<br>Estimé : %{y:,.0f} €<extra></extra>'
             ))
 
         # Ligne découvert
@@ -938,20 +1139,50 @@ with tabs[5]:
         st.plotly_chart(fig, width="stretch")
 
     # ── Tableau récap ───────────────────────────────────────────────────────
-    with st.expander("Tableau mensuel détaillé", expanded=False):
+    with st.expander("Tableau mensuel", expanded=False):
         for cpt_id in ['ca', 'mb']:
             st.markdown(f"**{COMPTES[cpt_id]['label']}**")
-            rows = month_bars(cpt_id)
+            rows_t = month_bars(cpt_id)
             df_rows = []
-            for r in rows:
+            for r in rows_t:
                 prefix = "~" if r['is_fc'] else ""
+                sol_str = "—"
+                if r['sol'] is not None:
+                    sol_str = f"{prefix}{round(r['sol']):,} €".replace(",", " ")
+                    if r['is_fc'] and r['sol_min'] is not None and r['sol_max'] is not None:
+                        sol_str += f" [{round(r['sol_min']):,}–{round(r['sol_max']):,}]".replace(",", " ")
                 df_rows.append({
                     'Mois': r['label'],
-                    'Entrées': f"{prefix}+{round(r['entrees']):,} €".replace(","," "),
-                    'Sorties': f"{prefix}−{round(r['sorties']):,} €".replace(","," "),
-                    'Solde fin': f"{prefix}{round(r['sol']):,} €".replace(","," ") if r['sol'] is not None else "—"
+                    'Entrées': f"{prefix}+{round(r['entrees']):,} €".replace(",", " "),
+                    'Sorties': f"{prefix}−{round(r['sorties']):,} €".replace(",", " "),
+                    'Solde (IC)': sol_str
                 })
             st.dataframe(pd.DataFrame(df_rows).set_index('Mois'), width="stretch")
+
+    with st.expander("Prévision détaillée par catégorie", expanded=False):
+        TENDANCE_ICON = {'hausse': '↑', 'baisse': '↓', 'stable': '→', 'insuffisant': '?'}
+        for cpt_id in ['ca', 'mb']:
+            st.markdown(f"**{COMPTES[cpt_id]['label']}**")
+            rows_fc = [r for r in month_bars(cpt_id) if r['is_fc'] and r['fc_detail']]
+            if not rows_fc:
+                st.info("Pas encore de données suffisantes pour ce compte.")
+                continue
+            for r in rows_fc:
+                ic = f"[{round(r['sol_min'] or 0):,} – {round(r['sol_max'] or 0):,} €]".replace(",", " ")
+                st.markdown(f"*{r['label']}* — sorties estimées **{round(r['sorties']):,} €** · Solde estimé {ic}".replace(",", " "))
+                cat_data = []
+                for cat, d in sorted(r['fc_detail'].items(), key=lambda x: -x[1]['moyen']):
+                    if d['moyen'] < 1: continue
+                    icon = TENDANCE_ICON.get(d['tendance'], '?')
+                    cat_data.append({
+                        'Catégorie': f"{icon} {cat}",
+                        'Estimé': f"{round(d['moyen']):,} €".replace(",", " "),
+                        'Min': f"{round(d['min']):,} €".replace(",", " "),
+                        'Max': f"{round(d['max']):,} €".replace(",", " "),
+                        'Tendance': d['tendance']
+                    })
+                if cat_data:
+                    st.dataframe(pd.DataFrame(cat_data).set_index('Catégorie'), width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PRÊTS

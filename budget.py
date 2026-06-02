@@ -688,14 +688,14 @@ def projection_fin_mois(cpt_id):
                 delta = r['mnt'] if r['type'] == 'revenu' else -r['mnt']
                 daily_events[r['jour']].append((r['nom'], delta))
 
-    # ── 3. MC restante à prélever sur CA ──────────────────────────────────
-    # = total MC du mois (déjà passé + futur saisi) - déjà prélevé à ce jour
-    # + MC récurrentes non encore appliquées (pas encore dans D['tx'])
+    # ── 3. Prélèvement MC sur CA en fin de mois ──────────────────────────────
+    # La MC est un débit différé : toutes les dépenses du mois sont prélevées
+    # EN UNE SEULE FOIS sur le CA. On prend le TOTAL du mois sans soustraire
+    # mc_a_ce_jour — rien n'a encore été prélevé sur le CA à ce stade.
     if cpt_id == 'ca':
-        mc_total_mois = mc_depenses_reelles(m, y)          # TX MC déjà saisies
-        mc_a_ce_jour  = mc_depenses_reelles(m, y, jusqu_au=now)  # déjà prélevé
-        mc_rec_restant = mc_rec_non_appliquees(m, y)       # récurrentes MC futures
-        mc_a_prelever  = (mc_total_mois - mc_a_ce_jour) + mc_rec_restant
+        mc_total_mois  = mc_depenses_reelles(m, y)    # TX MC affectées au mois
+        mc_rec_restant = mc_rec_non_appliquees(m, y)  # récurrentes MC pas encore saisies
+        mc_a_prelever  = mc_total_mois + mc_rec_restant
         if mc_a_prelever > 0:
             daily_events[last_day].append(("Prélèvement MC", -mc_a_prelever))
 

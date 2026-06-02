@@ -639,6 +639,111 @@ def build_forecast_v2():
     return months, daily_series, monthly_series, warnings_out
 
 
+def projection_fin_mois(cpt_id):
+    """
+    Projette le solde jour par jour de aujourd'hui à la fin du mois courant.
+
+    Prend en compte :
+      - Solde réel actuel (solde_a_date)
+      - Récurrentes restantes non appliquées (upcoming_rec)
+      - Revenus récurrents restants
+      - Encours MC restant à prélever sur CA (mc_depenses_reelles - mc_a_date)
+      - Transactions déjà saisies avec date future dans le mois
+
+    Retourne :
+      {
+        'solde_actuel': float | None,
+        'jours': [(date_str, solde, [evenements])],  # chaque jour jusqu'à fin mois
+        'solde_fin': float | None,
+        'point_bas': (date_str, float),
+        'point_bas_jour': int,
+        'manque': float,          # > 0 si dépassement découvert
+        'statut': 'ok' | 'warn' | 'danger',
+        'od': float,
+        'marge': float,
+      }
+    """
+    now = datetime.now()
+    m, y = now.month - 1, now.year
+    last_day = calendar.monthrange(y, m + 1)[1]
+    od = D['overdraft'].get(cpt_id, 0)
+    limite = -od
+
+    solde_act = solde_a_date(cpt_id)
+    if solde_act is None:
+        return {'solde_actuel': None, 'jours': [], 'solde_fin': None,
+                'point_bas': (None, None), 'point_bas_jour': None,
+                'manque': 0, 'statut': 'ok', 'od': od, 'marge': None}
+
+    # Construire delta par jour (aujourd'hui+1 → fin mois)
+    daily_events = defaultdict(list)  # jour → [(nom, montant_signé)]
+
+    # 1. Récurrentes restantes (revenus ET dépenses)
+    for r in D['rec']:
+        if r['compte'] == cpt_id and r['jour'] > now.day and not rec_applied(r['id'], m, y):
+            delta = r['mnt'] if r['type'] == 'revenu' else -r['mnt']
+            daily_events[r['jour']].append((r['nom'], delta))
+
+    # 2. MC restante à prélever sur CA : on l'affecte au dernier jour du mois
+    if cpt_id == 'ca':
+        mc_total_mois = mc_depenses_reelles(m, y)
+        mc_a_ce_jour  = mc_depenses_reelles(m, y, jusqu_au=now)
+        mc_restant = mc_total_mois - mc_a_ce_jour
+        # Ajouter MC récurrentes non encore appliquées
+        mc_restant += mc_rec_non_appliquees(m, y)
+        if mc_restant > 0:
+            daily_events[last_day].append(("Prélèvement MC", -mc_restant))
+
+    # 3. Transactions futures déjà saisies dans le mois (hors récurrentes)
+    for t in D['tx']:
+        t_date = datetime.strptime(t['date'], '%Y-%m-%d')
+        if (t['compte'] == cpt_id
+                and aff_key(t) == (y, m)
+                and t_date.date() > now.date()
+                and not t.get('recId')):
+            delta = t['montant'] if t['type'] == 'revenu' else -t['montant']
+            daily_events[t_date.day].append((t.get('note') or t['categorie'], delta))
+
+    # Construire la courbe jour par jour
+    sol = solde_act
+    jours = []
+    point_bas_sol = solde_act
+    point_bas_jour = now.day
+
+    for day in range(now.day + 1, last_day + 1):
+        evts = daily_events.get(day, [])
+        for nom, delta in evts:
+            sol += delta
+        date_str = f"{day:02d}/{m+1:02d}"
+        jours.append((date_str, round(sol, 2), [(n, d) for n, d in evts]))
+        if sol < point_bas_sol:
+            point_bas_sol = sol
+            point_bas_jour = day
+
+    sol_fin = jours[-1][1] if jours else solde_act
+    marge = sol_fin - limite
+    manque = max(0, -(min(point_bas_sol, sol_fin) - limite))
+
+    if point_bas_sol < limite:
+        statut = 'danger'
+    elif point_bas_sol < limite + 300:
+        statut = 'warn'
+    else:
+        statut = 'ok'
+
+    return {
+        'solde_actuel': solde_act,
+        'jours': jours,
+        'solde_fin': sol_fin,
+        'point_bas': (f"{point_bas_jour:02d}/{m+1:02d}", round(point_bas_sol, 2)),
+        'point_bas_jour': point_bas_jour,
+        'manque': round(manque, 2),
+        'statut': statut,
+        'od': od,
+        'marge': round(marge, 2),
+        'limite': limite,
+    }
+
 # ── CSS ─────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -691,157 +796,259 @@ tabs = st.tabs(["📍 Aujourd'hui","📊 Mois","📋 Transactions","✏️ Saisi
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[0]:
     now = datetime.now()
-    st.subheader(f"Situation au {now.strftime('%d/%m/%Y')}")
+    m_now, y_now = now.month - 1, now.year
+    last_day_now = calendar.monthrange(y_now, m_now + 1)[1]
 
-    cols = st.columns(2)
-    cpts_affich = [(k,v) for k,v in COMPTES.items() if k != 'mc']
-    for i, (cpt_id, cpt) in enumerate(cpts_affich):
-        with cols[i]:
+    # ── Projections des deux comptes ───────────────────────────────────────
+    proj_ca = projection_fin_mois('ca')
+    proj_mb = projection_fin_mois('mb')
+
+    # ── Sélecteur de compte pour le cockpit ────────────────────────────────
+    st.markdown(f"#### Cockpit trésorerie — {now.strftime('%d/%m/%Y')}")
+    cpt_cockpit = st.radio("Compte affiché", ['ca', 'mb'],
+                           format_func=lambda x: COMPTES[x]['label'],
+                           horizontal=True, key="cockpit_cpt")
+    proj = proj_ca if cpt_cockpit == 'ca' else proj_mb
+    cpt_info = COMPTES[cpt_cockpit]
+
+    # ══ 1. BANDEAU SYNTHÈSE ════════════════════════════════════════════════
+    if proj['solde_actuel'] is None:
+        st.warning(f"⚠️ Solde de début de mois non renseigné pour {cpt_info['label']} — allez dans l'onglet Mois pour le saisir.")
+    else:
+        statut = proj['statut']
+        sol_fin = proj['solde_fin']
+        pb_date, pb_sol = proj['point_bas']
+        marge = proj['marge']
+        od = proj['od']
+        limite = proj['limite']
+
+        if statut == 'ok':
+            emoji, titre, bg, border = "🟢", "Fin de mois sécurisée", "#f0faf4", "#1D9E75"
+        elif statut == 'warn':
+            emoji, titre, bg, border = "🟠", "Vigilance", "#fff8e6", "#D97706"
+        else:
+            emoji, titre, bg, border = "🔴", "Risque de découvert", "#fdf0f0", "#E24B4A"
+
+        manque_html = ""
+        if proj['manque'] > 0:
+            manque_html = f"<br><span style='color:#E24B4A;font-weight:600'>Manque estimé : {fmt2(proj['manque'])}</span>"
+
+        od_html = ""
+        if od > 0:
+            od_html = f"<br><small style='color:#888'>Découvert autorisé : {fmt2(limite)}</small>"
+
+        st.markdown(f"""
+        <div style="background:{bg};border-left:5px solid {border};border-radius:10px;padding:16px 20px;margin-bottom:16px;">
+            <div style="font-size:18px;font-weight:700;margin-bottom:8px;">{emoji} {titre}</div>
+            <div style="font-size:15px;">Solde estimé au {last_day_now:02d}/{m_now+1:02d} :
+                <strong style="color:{'#E24B4A' if (sol_fin or 0)<0 else '#1D9E75'}">{fmt2(sol_fin)}</strong>
+            </div>
+            <div style="font-size:13px;color:#555;margin-top:4px;">
+                Point le plus bas : <strong>{fmt2(pb_sol)}</strong> le {pb_date}
+            </div>
+            {"<div style='font-size:13px;color:#1D9E75;margin-top:4px;'>Marge avant découvert : " + fmt2(marge) + "</div>" if statut == 'ok' else ""}
+            {od_html}{manque_html}
+        </div>""", unsafe_allow_html=True)
+
+        # ══ 2. COURBE TRÉSORERIE JUSQU'À FIN DE MOIS ══════════════════════
+        if proj['jours']:
+            color = cpt_info['color']
+            r_int = int(color[1:3], 16)
+            g_int = int(color[3:5], 16)
+            b_int = int(color[5:7], 16)
+
+            # Point de départ = aujourd'hui
+            x_vals = [f"{now.day:02d}/{m_now+1:02d}"] + [j[0] for j in proj['jours']]
+            y_vals = [proj['solde_actuel']] + [j[1] for j in proj['jours']]
+
+            # Identifier les jours avec événements
+            evt_x, evt_y, evt_txt = [], [], []
+            for date_s, sol_j, evts in proj['jours']:
+                if evts:
+                    evt_x.append(date_s)
+                    evt_y.append(sol_j)
+                    lines_evt = "<br>".join(
+                        f"{'▲' if d>0 else '▼'} {n} : {'+' if d>0 else ''}{fmt2(d)}"
+                        for n, d in evts
+                    )
+                    evt_txt.append(lines_evt)
+
+            fig_c = go.Figure()
+
+            # Zone sous 0
+            fig_c.add_hrect(
+                y0=min(min(y_vals)*1.15, limite*1.3), y1=0,
+                fillcolor="rgba(220,50,50,0.05)", line_width=0
+            )
+
+            # Courbe principale
+            fig_c.add_trace(go.Scatter(
+                x=x_vals, y=y_vals,
+                mode='lines',
+                name=cpt_info['label'],
+                line=dict(color=color, width=2.5),
+                fill='tozeroy',
+                fillcolor=f"rgba({r_int},{g_int},{b_int},0.08)",
+                hovertemplate='%{x}<br>Solde : %{y:,.2f} €<extra></extra>'
+            ))
+
+            # Marqueurs événements
+            if evt_x:
+                fig_c.add_trace(go.Scatter(
+                    x=evt_x, y=evt_y,
+                    mode='markers',
+                    name='Événements',
+                    marker=dict(size=10, color=color, symbol='diamond',
+                                line=dict(width=1.5, color='white')),
+                    text=evt_txt,
+                    hovertemplate='%{x}<br>%{text}<extra></extra>'
+                ))
+
+            # Marqueur point bas
+            if pb_date and pb_date != f"{now.day:02d}/{m_now+1:02d}":
+                pb_color = "#E24B4A" if statut == 'danger' else "#D97706"
+                fig_c.add_trace(go.Scatter(
+                    x=[pb_date], y=[pb_sol],
+                    mode='markers+text',
+                    name='Point bas',
+                    marker=dict(size=12, color=pb_color, symbol='triangle-down'),
+                    text=[f"Min: {fmt2(pb_sol)}"],
+                    textposition='bottom center',
+                    hovertemplate=f'Point le plus bas<br>{fmt2(pb_sol)}<extra></extra>'
+                ))
+
+            # Ligne 0
+            fig_c.add_hline(y=0, line_dash="solid", line_color="rgba(0,0,0,0.2)", line_width=1)
+
+            # Ligne découvert
+            if od > 0:
+                fig_c.add_hline(
+                    y=limite, line_dash="dash", line_color="#E24B4A",
+                    line_width=1.5, opacity=0.7,
+                    annotation_text=f"Limite découvert ({fmt2(limite)})",
+                    annotation_position="bottom right"
+                )
+
+            fig_c.update_layout(
+                height=300,
+                margin=dict(t=20, b=40, l=50, r=20),
+                showlegend=False,
+                yaxis_title="Solde (€)",
+                hovermode='x unified',
+                plot_bgcolor='rgba(0,0,0,0)'
+            )
+            st.plotly_chart(fig_c, width="stretch")
+
+        # ══ 3. COLONNES : POINT BAS + ÉVÉNEMENTS + RECOMMANDATION ══════════
+        col_pb, col_evts = st.columns([1, 2])
+
+        with col_pb:
+            st.markdown("**📉 Point le plus bas**")
+            pb_color_txt = "#E24B4A" if pb_sol < 0 else ("#D97706" if pb_sol < 300 else "#1D9E75")
+            st.markdown(f"""
+            <div style="border:1px solid #e0e0e0;border-radius:10px;padding:14px;text-align:center;">
+                <div style="font-size:13px;color:#888;margin-bottom:4px;">{pb_date}</div>
+                <div style="font-size:24px;font-weight:700;color:{pb_color_txt}">{fmt2(pb_sol)}</div>
+                {"<div style='font-size:11px;color:#E24B4A;margin-top:4px;'>⚠️ Sous la limite découvert</div>" if pb_sol < limite else ""}
+            </div>""", unsafe_allow_html=True)
+
+            # Encours MC sur CA
+            if cpt_cockpit == 'ca':
+                mc_enc = mc_depenses_reelles(m_now, y_now, jusqu_au=now)
+                mc_rest = mc_depenses_reelles(m_now, y_now) + mc_rec_non_appliquees(m_now, y_now) - mc_enc
+                st.markdown(f"""
+                <div style="border:1px solid #e0e0e0;border-radius:10px;padding:12px;text-align:center;margin-top:8px;">
+                    <div style="font-size:11px;color:#888;">Encours MC à ce jour</div>
+                    <div style="font-size:18px;font-weight:600;color:{COMPTES['mc']['color']}">−{fmt2(mc_enc)}</div>
+                    <div style="font-size:11px;color:#888;margin-top:2px;">Restant à prélever : −{fmt2(mc_rest)}</div>
+                </div>""", unsafe_allow_html=True)
+
+        with col_evts:
+            st.markdown("**📅 Événements à venir**")
+            all_evts = [(j[0], n, d) for j in proj['jours'] for n, d in j[2]]
+            if all_evts:
+                for date_e, nom_e, delta_e in all_evts:
+                    sign = "+" if delta_e > 0 else ""
+                    color_e = "#1D9E75" if delta_e > 0 else "#E24B4A"
+                    st.markdown(
+                        f"<div style='padding:4px 0;border-bottom:1px solid #f0f0f0;font-size:13px;'>"
+                        f"<span style='color:#888;min-width:50px;display:inline-block'>{date_e}</span>"
+                        f" {nom_e} "
+                        f"<strong style='color:{color_e}'>{sign}{fmt2(delta_e)}</strong></div>",
+                        unsafe_allow_html=True
+                    )
+            else:
+                st.info("Aucun événement planifié jusqu'à fin de mois.")
+
+        # ══ 4. RECOMMANDATION ══════════════════════════════════════════════
+        st.markdown("---")
+        if statut == 'ok':
+            if marge > 1000:
+                reco = f"✓ La trésorerie reste largement positive tout le mois. Marge confortable de {fmt2(marge)}."
+            else:
+                reco = f"✓ La trésorerie reste positive tout le mois. Point bas à {fmt2(pb_sol)} le {pb_date}."
+            st.success(reco)
+        elif statut == 'warn':
+            reco = f"⚠️ La trésorerie descend sous {fmt2(limite + 300)} à partir du {pb_date} (point bas : {fmt2(pb_sol)})."
+            if proj['manque'] > 0:
+                reco += f" Manque estimé : {fmt2(proj['manque'])}."
+            st.warning(reco)
+        else:
+            reco = f"🔴 Dépassement du découvert autorisé prévu — point bas : {fmt2(pb_sol)} le {pb_date}."
+            reco += f"\n\nMontant manquant estimé : **{fmt2(proj['manque'])}**."
+            st.error(reco)
+
+    st.markdown("---")
+
+    # ══ 5. SOLDES + ALERTES (version compacte) ════════════════════════════
+    cols2 = st.columns(2)
+    cpts_affich2 = [(k,v) for k,v in COMPTES.items() if k != 'mc']
+    for i, (cpt_id, cpt) in enumerate(cpts_affich2):
+        with cols2[i]:
             solde = solde_a_date(cpt_id)
-            od = D['overdraft'].get(cpt_id, 0)
-            up = upcoming_rec(cpt_id)
-            up_net = sum(r['mnt'] if r['type']=='revenu' else -r['mnt'] for r in up)
-            proj = solde + up_net if solde is not None else None
-            deb = get_sol(cpt_id, now.month-1, now.year)
-            status = 'ok'
-            if solde is not None and solde < -od: status = 'danger'
-            elif (proj is not None and proj < -od) or (solde is not None and solde < (-od+300)): status = 'warn'
-            # Encours MC affiché uniquement sur CA
+            od2 = D['overdraft'].get(cpt_id, 0)
+            deb = get_sol(cpt_id, m_now, y_now)
+            status2 = 'ok'
+            if solde is not None and solde < -od2: status2 = 'danger'
+            elif solde is not None and solde < (-od2 + 300): status2 = 'warn'
+            # Encours MC sur CA
             mc_encours_html = ""
             if cpt_id == 'ca':
-                mc_encours = mc_depenses_reelles(now.month - 1, now.year, jusqu_au=now)
-                mc_color = COMPTES['mc']['color']
-                mc_encours_html = f"""<hr style="border:none;border-top:1px solid #e0e0e0;margin:8px 0">
-                <small style="color:#888">Encours Mastercard ce mois</small><br>
-                <span style="font-size:16px;font-weight:600;color:{mc_color}">−{fmt2(mc_encours)}</span>
-                <small style="color:#888"> (prélevé le 1er du mois prochain)</small><br>"""
-
+                mc_encours = mc_depenses_reelles(m_now, y_now, jusqu_au=now)
+                mc_color_h = COMPTES['mc']['color']
+                mc_encours_html = (f"<hr style='border:none;border-top:1px solid #e0e0e0;margin:6px 0'>"
+                                   f"<small style='color:#888'>Encours MC à ce jour</small><br>"
+                                   f"<span style='font-size:14px;font-weight:600;color:{mc_color_h}'>−{fmt2(mc_encours)}</span>")
             st.markdown(f"""
-            <div class="metric-card today-{status}">
-                <strong style="font-size:14px">{cpt['label']}</strong><br>
-                <small style="color:#888">Solde début de mois</small><br>
-                <span style="font-size:13px">{deb if deb is not None else 'Non renseigné'}</span><br><br>
-                <small style="color:#888">Solde au {now.day}/{now.month:02d}</small><br>
-                <span style="font-size:22px;font-weight:700;color:{'#E24B4A' if (solde or 0)<0 else '#1D9E75'}">{fmt2(solde)}</span><br>
-                <small style="color:#888">{'→ ' + fmt2(proj) + ' après prélèvements' if up else 'Aucun prélèvement en attente'}</small><br>
-                <small style="color:#888">Découvert autorisé : {fmt2(-od)}</small><br>
+            <div class="metric-card today-{status2}">
+                <strong style="font-size:13px">{cpt['label']}</strong>
+                <span style="float:right;font-size:11px;color:#888">début : {fmt2(deb) if deb is not None else '—'}</span><br>
+                <span style="font-size:20px;font-weight:700;color:{'#E24B4A' if (solde or 0)<0 else '#1D9E75'}">{fmt2(solde)}</span>
+                <small style="color:#888;display:block">Découvert autorisé : {fmt2(-od2)}</small>
                 {mc_encours_html}
             </div>""", unsafe_allow_html=True)
 
-    st.markdown("---")
-    col_al, col_od = st.columns([2,1])
-    with col_al:
-        st.markdown("**⚠️ Alertes & prélèvements à venir**")
-        has_alert = False
-        for cpt_id, cpt in COMPTES.items():
-            for typ, msg in get_alerts(cpt_id):
-                has_alert = True
-                st.markdown(f'<div class="alert-{typ}"><strong>{cpt["label"]}</strong> — {msg}</div>', unsafe_allow_html=True)
-        if not has_alert:
-            st.markdown('<div class="alert-ok">✓ Tous les comptes sont en ordre.</div>', unsafe_allow_html=True)
-        all_up = sorted(
-            [{'r':r,'cpt':COMPTES[cpt_id]} for cpt_id in COMPTES for r in upcoming_rec(cpt_id)],
-            key=lambda x: x['r']['jour']
-        )
-        if all_up:
-            st.markdown("**Prochains prélèvements :**")
-            for x in all_up:
-                r, cpt = x['r'], x['cpt']
-                sign = '−' if r['type']=='depense' else '+'
-                st.write(f"• **{cpt['label'].split()[0]}** — {r['nom']} — le {r['jour']} — {sign}{fmt2(r['mnt'])}")
-    with col_od:
-        st.markdown("**Découverts autorisés**")
-        for cpt_id, cpt in COMPTES.items():
-            new_od = st.number_input(cpt['label'], value=float(D['overdraft'].get(cpt_id,0)),
-                                     step=50.0, key=f"od_{cpt_id}")
-            if new_od != D['overdraft'].get(cpt_id,0):
-                D['overdraft'][cpt_id] = new_od; persist()
+    # Alertes
+    has_alert = False
+    for cpt_id2 in ['ca', 'mb']:
+        for typ, msg in get_alerts(cpt_id2):
+            has_alert = True
+            st.markdown(f'<div class="alert-{typ}"><strong>{COMPTES[cpt_id2]["label"]}</strong> — {msg}</div>',
+                        unsafe_allow_html=True)
+    if not has_alert:
+        st.markdown('<div class="alert-ok">✓ Tous les comptes sont en ordre.</div>', unsafe_allow_html=True)
 
-    st.markdown("---")
-
-    # ── Visuel besoin de trésorerie jusqu'à fin de mois ────────────────────
-    st.markdown("**💡 Besoin de trésorerie — fin de mois**")
-    now_m, now_y = now.month - 1, now.year
-    import calendar as _cal
-    last_day_now = _cal.monthrange(now_y, now_m + 1)[1]
-    days_left = last_day_now - now.day
-
-    tres_cols = st.columns(2)
-    for ti, (cpt_id, cpt) in enumerate([(k,v) for k,v in COMPTES.items() if k != 'mc']):
-        with tres_cols[ti]:
-            solde_now = solde_a_date(cpt_id)
-            od = D['overdraft'].get(cpt_id, 0)
-            if solde_now is None:
-                st.info(f"{cpt['label']} — solde non renseigné")
-                continue
-
-            # Récurrentes restantes
-            up_r = upcoming_rec(cpt_id)
-            rec_restant = sum(r['mnt'] if r['type']=='revenu' else -r['mnt'] for r in up_r)
-            # MC restante sur CA
-            mc_restant = 0.0
-            if cpt_id == 'ca':
-                mc_tot  = mc_depenses_reelles(now_m, now_y)
-                mc_deja = mc_depenses_reelles(now_m, now_y, jusqu_au=now)
-                mc_restant = -(mc_tot - mc_deja)
-
-            solde_proj = solde_now + rec_restant + mc_restant
-            limite = -od
-            marge = solde_proj - limite
-
-            # Barre de progression : solde projeté vs limite découvert
-            color = cpt['color']
-            pct_used = max(0, min(100, int((limite - solde_proj) / max(1, abs(limite) + abs(solde_now)) * 100)))
-            if marge >= 500:
-                status_txt = f"✅ Marge : {fmt2(marge)}"
-                bar_color = "#1D9E75"
-            elif marge >= 0:
-                status_txt = f"⚠️ Marge faible : {fmt2(marge)}"
-                bar_color = "#D97706"
-            else:
-                status_txt = f"🔴 Dépassement : {fmt2(marge)}"
-                bar_color = "#E24B4A"
-
-            # Mini graphique Plotly waterfall simplifié
-            fig_t = go.Figure()
-            categories_t = ["Solde actuel"]
-            values_t = [solde_now]
-            colors_t = [color]
-            if rec_restant != 0:
-                categories_t.append("Prélèvements restants")
-                values_t.append(rec_restant)
-                colors_t.append("#1D9E75" if rec_restant > 0 else "#E24B4A")
-            if mc_restant != 0 and cpt_id == 'ca':
-                categories_t.append("MC restante")
-                values_t.append(mc_restant)
-                colors_t.append("#E24B4A")
-            categories_t.append("Solde fin estimé")
-            values_t.append(solde_proj)
-            colors_t.append(bar_color)
-
-            fig_t.add_trace(go.Bar(
-                x=categories_t, y=values_t,
-                marker_color=colors_t,
-                text=[fmt2(v) for v in values_t],
-                textposition='outside',
-                hovertemplate='%{x}<br>%{y:,.2f} €<extra></extra>'
-            ))
-            fig_t.add_hline(y=limite, line_dash="dash", line_color="#E24B4A",
-                            line_width=1.5, opacity=0.7,
-                            annotation_text=f"Limite ({fmt2(limite)})",
-                            annotation_position="bottom right")
-            fig_t.update_layout(
-                title=dict(text=f"{cpt['label']} — {days_left}j restants", font_size=13),
-                height=260, margin=dict(t=40, b=10, l=10, r=10),
-                showlegend=False, yaxis_title="€",
-                plot_bgcolor='rgba(0,0,0,0)'
-            )
-            st.plotly_chart(fig_t, width="stretch")
-            st.caption(status_txt)
+    # Découverts modifiables
+    with st.expander("⚙️ Modifier les découverts autorisés", expanded=False):
+        for cpt_id3, cpt3 in COMPTES.items():
+            new_od = st.number_input(cpt3['label'], value=float(D['overdraft'].get(cpt_id3,0)),
+                                     step=50.0, key=f"od_{cpt_id3}")
+            if new_od != D['overdraft'].get(cpt_id3,0):
+                D['overdraft'][cpt_id3] = new_od; persist()
 
     st.markdown("---")
     st.markdown("**Dernières transactions du mois**")
-    tx_now = sorted(tx_of_month(now.month-1, now.year), key=lambda t: t['date'], reverse=True)[:8]
+    tx_now = sorted(tx_of_month(m_now, y_now), key=lambda t: t['date'], reverse=True)[:8]
     if tx_now:
         st.dataframe(pd.DataFrame([{
             'Date': datetime.strptime(t['date'],'%Y-%m-%d').strftime('%d/%m/%Y'),

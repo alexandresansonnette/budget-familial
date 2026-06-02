@@ -37,6 +37,9 @@ CATS_DEFAULT = sorted([
     'CLAE / École','Loisirs / Vacances','Voiture','Abonnement','Tontine',
     'Épargne','Virement interne','Impôts / Taxes','Divers'
 ])
+# Catégories neutres : exclues du prévisionnel côté revenus ET dépenses
+# car elles représentent des flux internes sans impact sur le solde global
+CATS_NEUTRES = {'Virement interne', 'Épargne'}
 CC = ['#378ADD','#1D9E75','#D85A30','#D4537E','#7F77DD',
       '#639922','#BA7517','#E24B4A','#888780','#0F6E56']
 GSHEET_NAME = "Budget Familial AS"
@@ -278,7 +281,7 @@ def prevision_depenses(cpt_id, mois_cibles):
     cm, cy = now.month - 1, now.year
 
     # Catégories à exclure du variable (ne reflètent pas une vraie dépense nette)
-    CATS_EXCLUES = {'Virement interne', 'Épargne'}
+    CATS_EXCLUES = CATS_NEUTRES
 
     # Récurrentes connues : leurs catégories sont fixes → exclues du variable
     rec_ids = {r['id'] for r in D['rec']}
@@ -532,14 +535,19 @@ def build_forecast_v2():
                       and t['type'] == 'revenu'
                       and not t.get('recId')
                       and not t.get('exceptionnel', False)
-                      and t.get('categorie') not in {'Virement interne'}]
+                      and t.get('categorie') not in CATS_NEUTRES]
             if tx_rev:
                 past_rev_nets.append(sum(t['montant'] for t in tx_rev))
-        # Moyenne pondérée exponentielle sur les revenus non-récurrents passés
+        # Filtre IQR sur les revenus variables pour éliminer les mois atypiques
+        if len(past_rev_nets) >= 4:
+            q1_r, q3_r = np.percentile(past_rev_nets, 25), np.percentile(past_rev_nets, 75)
+            iqr_r = q3_r - q1_r
+            past_rev_nets = [v for v in past_rev_nets
+                             if q1_r - 1.5*iqr_r <= v <= q3_r + 1.5*iqr_r]
+        # EWM sur les revenus variables filtrés
         if past_rev_nets:
-            import numpy as _np
-            w = _np.exp(-0.2 * _np.arange(len(past_rev_nets)-1, -1, -1))
-            avg_rev_var = float(_np.average(past_rev_nets, weights=w))
+            w = np.exp(-0.2 * np.arange(len(past_rev_nets)-1, -1, -1))
+            avg_rev_var = float(np.average(past_rev_nets, weights=w))
         else:
             avg_rev_var = 0.0
 
@@ -1288,7 +1296,7 @@ with tabs[8]:
 
     now_d = datetime.now()
     cm_d, cy_d = now_d.month - 1, now_d.year
-    CATS_EXCLUES_D = {'Virement interne', 'Épargne'}
+    CATS_EXCLUES_D = CATS_NEUTRES
     rec_ids_d = {r['id'] for r in D['rec']}
 
     # Reconstituer l'historique tel que vu par le modèle
@@ -1323,7 +1331,7 @@ with tabs[8]:
     st.markdown("### Revenus estimés pour les mois futurs")
     rec_rev_d = sum(r['mnt'] for r in D['rec']
                     if r['compte'] == diag_cpt and r['type'] == 'revenu')
-    past_rev_d = []
+    past_rev_raw = []
     for i in range(6):
         pm2, py2 = month_add(cm_d, cy_d, -(i+1))
         tx_rev = [t for t in D['tx']
@@ -1332,22 +1340,41 @@ with tabs[8]:
                   and t['type'] == 'revenu'
                   and not t.get('recId')
                   and not t.get('exceptionnel', False)
-                  and t.get('categorie') not in {'Virement interne'}]
+                  and t.get('categorie') not in CATS_NEUTRES]
         if tx_rev:
             total_rev = sum(t['montant'] for t in tx_rev)
-            past_rev_d.append((f"{MOIS_COURT[pm2]} {py2}", round(total_rev, 2)))
+            past_rev_raw.append((f"{MOIS_COURT[pm2]} {py2}", round(total_rev, 2)))
+
+    # Filtre IQR sur les revenus variables
+    vals_rev_d = [v for _, v in past_rev_raw]
+    if len(vals_rev_d) >= 4:
+        q1_r, q3_r = np.percentile(vals_rev_d, 25), np.percentile(vals_rev_d, 75)
+        iqr_r = q3_r - q1_r
+        lo_r, hi_r = q1_r - 1.5*iqr_r, q3_r + 1.5*iqr_r
+        past_rev_d = [(lbl, v) for lbl, v in past_rev_raw if lo_r <= v <= hi_r]
+        outliers_rev = [(lbl, v) for lbl, v in past_rev_raw if not (lo_r <= v <= hi_r)]
+    else:
+        past_rev_d = past_rev_raw
+        outliers_rev = []
 
     r1, r2, r3 = st.columns(3)
     r1.metric("Récurrentes revenus (D['rec'])", fmt(rec_rev_d))
     avg_rev_var_d = sum(v for _, v in past_rev_d) / len(past_rev_d) if past_rev_d else 0
-    r2.metric("Revenus variables moyens (6 mois)", fmt(avg_rev_var_d))
+    r2.metric("Revenus variables moyens filtrés", fmt(avg_rev_var_d))
     r3.metric("Total rev. estimé / mois", fmt(rec_rev_d + avg_rev_var_d))
 
-    if past_rev_d:
-        df_rev = pd.DataFrame(past_rev_d, columns=['Mois', 'Revenus variables'])
-        st.dataframe(df_rev.set_index('Mois'), width="stretch")
+    if past_rev_raw:
+        df_rev_rows = []
+        outlier_labels = {lbl for lbl, _ in outliers_rev}
+        for lbl, v in past_rev_raw:
+            flag = "⚠️ outlier exclu" if lbl in outlier_labels else "✓ inclus"
+            df_rev_rows.append({'Mois': lbl, 'Revenus variables': fmt(v), 'Statut IQR': flag})
+        st.dataframe(pd.DataFrame(df_rev_rows).set_index('Mois'), width="stretch")
+        if outliers_rev:
+            st.caption(f"⚠️ {len(outliers_rev)} mois exclus comme outliers revenus : "
+                       + ", ".join(f"{l} ({fmt(v)})" for l, v in outliers_rev))
     else:
-        st.warning("Aucun revenu variable détecté sur les 6 derniers mois.")
+        st.warning("Aucun revenu variable détecté (hors virements internes et récurrentes).")
 
     st.divider()
 

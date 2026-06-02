@@ -824,26 +824,30 @@ with tabs[0]:
         else:
             emoji, titre, bg, border = "🔴", "Risque de découvert", "#fdf0f0", "#E24B4A"
 
-        manque_html = ""
-        if proj['manque'] > 0:
-            manque_html = f"<br><span style='color:#E24B4A;font-weight:600'>Manque estimé : {fmt2(proj['manque'])}</span>"
-
-        od_html = ""
+        # Construire les blocs HTML optionnels proprement (pas d'apostrophes imbriquées)
+        sol_color = "#E24B4A" if (sol_fin or 0) < 0 else "#1D9E75"
+        marge_bloc = ""
+        if statut == 'ok':
+            marge_bloc = f'<div style="font-size:13px;color:#1D9E75;margin-top:4px;">Marge avant découvert : {fmt2(marge)}</div>'
+        od_bloc = ""
         if od > 0:
-            od_html = f"<br><small style='color:#888'>Découvert autorisé : {fmt2(limite)}</small>"
+            od_bloc = f'<div style="font-size:12px;color:#888;margin-top:4px;">Découvert autorisé : {fmt2(limite)}</div>'
+        manque_bloc = ""
+        if proj['manque'] > 0:
+            manque_bloc = f'<div style="font-size:14px;font-weight:600;color:#E24B4A;margin-top:6px;">Manque estimé : {fmt2(proj["manque"])}</div>'
 
-        st.markdown(f"""
-        <div style="background:{bg};border-left:5px solid {border};border-radius:10px;padding:16px 20px;margin-bottom:16px;">
-            <div style="font-size:18px;font-weight:700;margin-bottom:8px;">{emoji} {titre}</div>
-            <div style="font-size:15px;">Solde estimé au {last_day_now:02d}/{m_now+1:02d} :
-                <strong style="color:{'#E24B4A' if (sol_fin or 0)<0 else '#1D9E75'}">{fmt2(sol_fin)}</strong>
-            </div>
-            <div style="font-size:13px;color:#555;margin-top:4px;">
-                Point le plus bas : <strong>{fmt2(pb_sol)}</strong> le {pb_date}
-            </div>
-            {"<div style='font-size:13px;color:#1D9E75;margin-top:4px;'>Marge avant découvert : " + fmt2(marge) + "</div>" if statut == 'ok' else ""}
-            {od_html}{manque_html}
-        </div>""", unsafe_allow_html=True)
+        html_bandeau = (
+            f'<div style="background:{bg};border-left:5px solid {border};'
+            f'border-radius:10px;padding:16px 20px;margin-bottom:16px;">'
+            f'<div style="font-size:18px;font-weight:700;margin-bottom:8px;">{emoji} {titre}</div>'
+            f'<div style="font-size:15px;">Solde estimé au {last_day_now:02d}/{m_now+1:02d} : '
+            f'<strong style="color:{sol_color}">{fmt2(sol_fin)}</strong></div>'
+            f'<div style="font-size:13px;color:#555;margin-top:4px;">'
+            f'Point le plus bas : <strong>{fmt2(pb_sol)}</strong> le {pb_date}</div>'
+            f'{marge_bloc}{od_bloc}{manque_bloc}'
+            f'</div>'
+        )
+        st.markdown(html_bandeau, unsafe_allow_html=True)
 
         # ══ 2. COURBE TRÉSORERIE JUSQU'À FIN DE MOIS ══════════════════════
         if proj['jours']:

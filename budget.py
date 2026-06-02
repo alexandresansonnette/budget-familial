@@ -296,6 +296,7 @@ def prevision_depenses(cpt_id, mois_cibles):
                 and aff_key(t) == (y, m)
                 and t['type'] == 'depense'
                 and not t.get('recId')
+                and not t.get('exceptionnel', False)
                 and t.get('categorie') not in CATS_EXCLUES]
         # Pour CA : inclure TX MC non-récurrentes affectées à ce mois
         if cpt_id == 'ca':
@@ -303,6 +304,7 @@ def prevision_depenses(cpt_id, mois_cibles):
                      if t['compte'] == 'mc'
                      and t['type'] == 'depense'
                      and not t.get('recId')
+                     and not t.get('exceptionnel', False)
                      and t.get('categorie') not in CATS_EXCLUES
                      and aff_key(t) == (y, m)]
         cat_totals = defaultdict(float)
@@ -529,6 +531,7 @@ def build_forecast_v2():
                       and aff_key(t) == (py2, pm2)
                       and t['type'] == 'revenu'
                       and not t.get('recId')
+                      and not t.get('exceptionnel', False)
                       and t.get('categorie') not in {'Virement interne'}]
             if tx_rev:
                 past_rev_nets.append(sum(t['montant'] for t in tx_rev))
@@ -807,7 +810,17 @@ with tabs[2]:
         for t in tx_show:
             d = datetime.strptime(t['date'],'%Y-%m-%d')
             cpt = COMPTES.get(t['compte'],{'label':t['compte']})
-            with st.expander(f"{'−' if t['type']=='depense' else '+'}{fmt2(t['montant'])} — {t.get('note') or t['categorie']} — {d.strftime('%d/%m/%Y')}", expanded=False):
+            is_exc = t.get('exceptionnel', False)
+            exc_badge = " ⭐" if is_exc else ""
+            with st.expander(f"{'−' if t['type']=='depense' else '+'}{fmt2(t['montant'])} — {t.get('note') or t['categorie']} — {d.strftime('%d/%m/%Y')}{exc_badge}", expanded=False):
+                # Bouton rapide exceptionnel HORS formulaire
+                btn_label = "⭐ Marquer normale" if is_exc else "⭐ Marquer exceptionnelle"
+                if st.button(btn_label, key=f"exc_quick_{t['id']}"):
+                    idx = next(i for i,x in enumerate(D['tx']) if x['id']==t['id'])
+                    D['tx'][idx] = {**t, 'exceptionnel': not is_exc}
+                    persist(); st.rerun()
+                if is_exc:
+                    st.caption("⭐ Transaction exceptionnelle — exclue du calcul de prévision")
                 with st.form(key=f"edit_tx_{t['id']}"):
                     ef1,ef2 = st.columns(2)
                     with ef1:
@@ -827,6 +840,8 @@ with tabs[2]:
                         new_mnt = st.number_input("Montant €", value=float(t['montant']),
                                                   step=0.01, format="%.2f", key=f"tm_{t['id']}")
                         new_note = st.text_input("Note", value=t.get('note',''), key=f"tn_{t['id']}")
+                        new_exc = st.checkbox("⭐ Exceptionnelle (exclue du prévisionnel)",
+                                              value=is_exc, key=f"texc_{t['id']}")
 
                     new_affm, new_affy = t.get('affM'), t.get('affY')
                     if new_cpt == 'mc':
@@ -844,7 +859,8 @@ with tabs[2]:
                         D['tx'][idx] = {**t, 'date': new_date.strftime('%Y-%m-%d'),
                                         'compte': new_cpt, 'categorie': new_cat,
                                         'montant': float(new_mnt), 'type': new_type,
-                                        'note': new_note, 'affM': new_affm, 'affY': new_affy}
+                                        'note': new_note, 'affM': new_affm, 'affY': new_affy,
+                                        'exceptionnel': new_exc}
                         persist(); st.success("✓"); st.rerun()
                 if st.button("🗑 Supprimer", key=f"del_tx_{t['id']}"):
                     D['tx'] = [x for x in D['tx'] if x['id']!=t['id']]
@@ -1287,12 +1303,14 @@ with tabs[8]:
                 and aff_key(t) == (y_h, m_h)
                 and t['type'] == 'depense'
                 and not t.get('recId')
+                and not t.get('exceptionnel', False)
                 and t.get('categorie') not in CATS_EXCLUES_D]
         if diag_cpt == 'ca':
             tx_m += [t for t in D['tx']
                      if t['compte'] == 'mc'
                      and t['type'] == 'depense'
                      and not t.get('recId')
+                     and not t.get('exceptionnel', False)
                      and t.get('categorie') not in CATS_EXCLUES_D
                      and aff_key(t) == (y_h, m_h)]
         cat_totals = defaultdict(float)
@@ -1313,6 +1331,7 @@ with tabs[8]:
                   and aff_key(t) == (py2, pm2)
                   and t['type'] == 'revenu'
                   and not t.get('recId')
+                  and not t.get('exceptionnel', False)
                   and t.get('categorie') not in {'Virement interne'}]
         if tx_rev:
             total_rev = sum(t['montant'] for t in tx_rev)

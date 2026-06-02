@@ -517,12 +517,34 @@ def build_forecast_v2():
         daily_series[cpt_id] = daily_pts
 
         # ── Points mensuels (12 mois) ──────────────────────────────────────
-        # Futur : prévision par catégorie avec modèle combiné
-        future_months = [(m, y) for m, y in months[7:]]  # +1 à +5
-        fc_results = prevision_depenses(cpt_id, future_months) if future_months else []
+        # Revenus futurs = récurrentes revenus + moyenne pondérée revenus passés non-récurrents
+        rec_rev = sum(r['mnt'] for r in D['rec']
+                      if r['compte'] == cpt_id and r['type'] == 'revenu')
 
-        rec_net_rev = sum(r['mnt'] for r in D['rec']
-                          if r['compte'] == cpt_id and r['type'] == 'revenu')
+        past_rev_nets = []
+        for i in range(6):  # 6 mois passés
+            pm2, py2 = months[i]
+            tx_rev = [t for t in D['tx']
+                      if t['compte'] == cpt_id
+                      and aff_key(t) == (py2, pm2)
+                      and t['type'] == 'revenu'
+                      and not t.get('recId')
+                      and t.get('categorie') not in {'Virement interne'}]
+            if tx_rev:
+                past_rev_nets.append(sum(t['montant'] for t in tx_rev))
+        # Moyenne pondérée exponentielle sur les revenus non-récurrents passés
+        if past_rev_nets:
+            import numpy as _np
+            w = _np.exp(-0.2 * _np.arange(len(past_rev_nets)-1, -1, -1))
+            avg_rev_var = float(_np.average(past_rev_nets, weights=w))
+        else:
+            avg_rev_var = 0.0
+
+        rev_futur = rec_rev + avg_rev_var
+
+        # Prévision dépenses par catégorie (modèle combiné + IQR)
+        future_months = [(m, y) for m, y in months[7:]]  # mois +1 à +5
+        fc_results = prevision_depenses(cpt_id, future_months) if future_months else []
 
         monthly_pts = []
         fc_idx = 0
@@ -532,14 +554,14 @@ def build_forecast_v2():
             label = f"{MOIS_COURT[m]} {y}"
 
             if rel <= 0:
-                # Passé + mois courant : lire depuis courbe journalière
+                # Passé + mois courant : solde fin de mois depuis courbe journalière
                 prefix = f"{y}-{m+1:02d}-"
                 pts_m = [(ds, sv) for ds, sv in daily_series[cpt_id] if ds.startswith(prefix)]
                 val = pts_m[-1][1] if pts_m else None
                 val_min = val_max = val
                 is_fc = False
             else:
-                # Futur : modèle combiné
+                # Futur : solde précédent + revenus estimés - dépenses estimées
                 prev_val = monthly_pts[-1][0] if monthly_pts else None
                 if prev_val is None:
                     val = val_min = val_max = None
@@ -551,9 +573,9 @@ def build_forecast_v2():
                         dep_max   = fc['total_max']
                     else:
                         dep_moyen = dep_min = dep_max = 0.0
-                    val     = prev_val + rec_net_rev - dep_moyen
-                    val_min = prev_val + rec_net_rev - dep_max   # sorties max → solde min
-                    val_max = prev_val + rec_net_rev - dep_min   # sorties min → solde max
+                    val     = prev_val + rev_futur - dep_moyen
+                    val_min = prev_val + rev_futur - dep_max   # pire cas : sorties max
+                    val_max = prev_val + rev_futur - dep_min   # meilleur cas : sorties min
                 fc_idx += 1
                 is_fc = True
 

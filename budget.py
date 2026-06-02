@@ -268,49 +268,42 @@ def resolve_sol(cpt_id, target_m, target_y):
 
 def prevision_depenses(cpt_id, mois_cibles):
     """
-    Modèle de prévision des dépenses variables par catégorie.
-    Combine tendance linéaire + moyenne pondérée exponentielle + saisonnalité.
-    Les poids s'ajustent selon la quantité d'historique disponible.
-
-    Paramètres :
-      cpt_id       : 'ca' ou 'mb'
-      mois_cibles  : liste de (m, y) 0-indexed pour lesquels prévoir
-
-    Retourne :
-      {
-        'total_moyen': float,
-        'total_min': float,
-        'total_max': float,
-        'par_categorie': { cat: {'moyen':float,'min':float,'max':float,'tendance':str} }
-      }
-      pour chaque mois cible : liste de dicts dans le même ordre que mois_cibles
+    Prévision des dépenses variables par catégorie.
+    - Exclut : virements internes, catégories récurrentes connues
+    - Filtre IQR : exclut les valeurs aberrantes (outliers) par catégorie
+    - Modèle combiné : EWM + tendance linéaire + saisonnalité
+    - MC : incluse dans l'historique CA mais PAS dans rec_total (évite double comptage)
     """
     now = datetime.now()
     cm, cy = now.month - 1, now.year
 
-    # ── Collecter tout l'historique mensuel par catégorie ─────────────────────
-    # On remonte jusqu'à 18 mois pour avoir de la saisonnalité
-    hist_months = [month_add(cm, cy, -i) for i in range(1, 19)]
-    hist_months.reverse()  # ordre chronologique
+    # Catégories à exclure du variable (ne reflètent pas une vraie dépense nette)
+    CATS_EXCLUES = {'Virement interne', 'Épargne'}
 
-    # Identifiants des récurrentes connues → exclus des dépenses variables
+    # Récurrentes connues : leurs catégories sont fixes → exclues du variable
     rec_ids = {r['id'] for r in D['rec']}
-    rec_cats_fixes = {r['cat'] for r in D['rec'] if r['compte'] == cpt_id}
 
-    # Historique : { cat: [(abs_month, montant), ...] }
+    # Historique mensuel variable par catégorie (18 mois max)
+    hist_months = [month_add(cm, cy, -i) for i in range(1, 19)]
+    hist_months.reverse()
+
     hist = defaultdict(list)
     for m, y in hist_months:
         abs_m = y * 12 + m
+        # TX directes du compte (hors récurrentes, hors catégories exclues)
         tx_m = [t for t in D['tx']
                 if t['compte'] == cpt_id
                 and aff_key(t) == (y, m)
                 and t['type'] == 'depense'
-                and not t.get('recId')]
-        # Pour CA inclure aussi MC affectée
+                and not t.get('recId')
+                and t.get('categorie') not in CATS_EXCLUES]
+        # Pour CA : inclure TX MC non-récurrentes affectées à ce mois
         if cpt_id == 'ca':
             tx_m += [t for t in D['tx']
                      if t['compte'] == 'mc'
                      and t['type'] == 'depense'
+                     and not t.get('recId')
+                     and t.get('categorie') not in CATS_EXCLUES
                      and aff_key(t) == (y, m)]
         cat_totals = defaultdict(float)
         for t in tx_m:
@@ -318,118 +311,108 @@ def prevision_depenses(cpt_id, mois_cibles):
         for cat, total in cat_totals.items():
             hist[cat].append((abs_m, total))
 
-    # ── Fonction de prévision pour une catégorie ──────────────────────────────
-    def predict_cat(cat, target_m, target_y):
-        data = sorted(hist.get(cat, []), key=lambda x: x[0])
-        n = len(data)
-        target_abs = target_y * 12 + target_m
+    # Filtre IQR par catégorie : exclure les mois aberrants (outliers)
+    def filter_iqr(data):
+        if len(data) < 4:
+            return data
+        vals = np.array([v for _, v in data])
+        q1, q3 = np.percentile(vals, 25), np.percentile(vals, 75)
+        iqr = q3 - q1
+        lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        return [(a, v) for a, v in data if lo <= v <= hi]
 
+    def predict_cat(cat, target_m, target_y):
+        raw = sorted(hist.get(cat, []), key=lambda x: x[0])
+        data = filter_iqr(raw)
+        n = len(data)
         if n == 0:
+            # Si tout a été filtré, prendre la médiane brute
+            if raw:
+                return float(np.median([v for _, v in raw])), 0.0, float(np.median([v for _, v in raw]))
             return 0.0, 0.0, 0.0
 
         vals = np.array([v for _, v in data])
         abs_months = np.array([a for a, _ in data])
+        target_abs = target_y * 12 + target_m
 
-        # ── Composante 1 : moyenne pondérée exponentielle (toujours active) ──
-        # Decay : mois récent pèse e^0 = 1, il y a 6 mois e^(-0.3*6) ≈ 0.16
+        # Composante 1 : EWM
         decay = 0.25
         weights = np.exp(-decay * (target_abs - abs_months))
         weights = np.maximum(weights, 1e-6)
         ewm = float(np.average(vals, weights=weights))
 
-        # ── Composante 2 : tendance linéaire (active si n >= 3) ──────────────
+        # Composante 2 : tendance linéaire (si n >= 3)
         if n >= 3:
             x = abs_months - abs_months.mean()
-            slope = float(np.polyfit(x, vals, 1)[0])
-            # Projection de la tendance sur le mois cible
             x_target = target_abs - abs_months.mean()
-            trend_val = float(np.polyval(np.polyfit(x, vals, 1), x_target))
-            trend_val = max(0.0, trend_val)
-            # Poids tendance : monte de 0 à 0.4 entre 3 et 10 obs
+            trend_val = max(0.0, float(np.polyval(np.polyfit(x, vals, 1), x_target)))
             w_trend = min(0.4, (n - 2) / 8 * 0.4)
         else:
             trend_val = ewm
             w_trend = 0.0
-            slope = 0.0
 
-        # ── Composante 3 : saisonnalité (active si >= 2 obs du même mois) ────
+        # Composante 3 : saisonnalité (si >= 2 obs du même mois)
         same_month = [(a, v) for a, v in data if a % 12 == target_m]
         if len(same_month) >= 2:
-            sm_vals = np.array([v for _, v in same_month])
             overall_mean = vals.mean() if vals.mean() > 0 else 1.0
-            seasonal_ratio = sm_vals.mean() / overall_mean
-            # Poids saisonnalité : monte de 0 à 0.3 avec les données disponibles
+            seasonal_ratio = np.mean([v for _, v in same_month]) / overall_mean
             w_seasonal = min(0.3, len(same_month) / 4 * 0.3)
-            seasonal_contrib = seasonal_ratio
         else:
+            seasonal_ratio = 1.0
             w_seasonal = 0.0
-            seasonal_contrib = 1.0
 
-        # ── Combinaison ───────────────────────────────────────────────────────
         w_ewm = 1.0 - w_trend - w_seasonal
         if w_seasonal > 0:
-            pred = w_ewm * ewm + w_trend * trend_val + w_seasonal * (ewm * seasonal_contrib)
+            pred = w_ewm * ewm + w_trend * trend_val + w_seasonal * (ewm * seasonal_ratio)
         else:
             pred = w_ewm * ewm + w_trend * trend_val
         pred = max(0.0, pred)
 
-        # ── Intervalle de confiance : écart-type résiduel ─────────────────────
+        # Intervalle de confiance
         if n >= 2:
-            residuals = vals - np.mean(vals)
-            std = float(np.std(residuals))
-            # IC à ~80% : ±1.28σ, réduit si peu de données
+            std = float(np.std(vals))
             ic_factor = min(1.28, 0.5 + n * 0.1)
             margin = std * ic_factor
         else:
-            margin = pred * 0.3  # ±30% par défaut
-
+            margin = pred * 0.3
         return pred, max(0.0, pred - margin), pred + margin
 
-    # ── Prévision pour chaque mois cible ─────────────────────────────────────
-    all_cats = sorted(hist.keys())
-    results = []
+    # Récurrentes DEPENSES fixes (sans MC pour CA → déjà dans hist variable)
+    rec_total_ca_propre = sum(r['mnt'] for r in D['rec']
+                              if r['compte'] == cpt_id and r['type'] == 'depense')
+    # MC récurrentes ajoutées séparément pour CA (débit différé fixe)
+    mc_rec_total = sum(r['mnt'] for r in D['rec']
+                       if r['compte'] == 'mc' and r['type'] == 'depense') if cpt_id == 'ca' else 0.0
 
+    results = []
     for target_m, target_y in mois_cibles:
         par_cat = {}
-        for cat in all_cats:
+        for cat in sorted(hist.keys()):
             moyen, lo, hi = predict_cat(cat, target_m, target_y)
-            # Tendance qualitative
-            data = sorted(hist.get(cat, []), key=lambda x: x[0])
+            data = filter_iqr(sorted(hist.get(cat, []), key=lambda x: x[0]))
             if len(data) >= 3:
                 recent = np.mean([v for _, v in data[-3:]])
                 older  = np.mean([v for _, v in data[:max(1, len(data)-3)]])
-                if recent > older * 1.1:
-                    tendance = "hausse"
-                elif recent < older * 0.9:
-                    tendance = "baisse"
-                else:
-                    tendance = "stable"
+                tendance = "hausse" if recent > older*1.1 else ("baisse" if recent < older*0.9 else "stable")
             else:
                 tendance = "insuffisant"
             par_cat[cat] = {'moyen': moyen, 'min': lo, 'max': hi, 'tendance': tendance}
 
-        total_moyen = sum(v['moyen'] for v in par_cat.values())
-        total_min   = sum(v['min']   for v in par_cat.values())
-        total_max   = sum(v['max']   for v in par_cat.values())
-
-        # Ajouter récurrentes (montant fixe, pas d'incertitude)
-        rec_total = sum(r['mnt'] for r in D['rec']
-                        if r['compte'] == cpt_id and r['type'] == 'depense')
-        if cpt_id == 'ca':
-            rec_total += sum(r['mnt'] for r in D['rec']
-                             if r['compte'] == 'mc' and r['type'] == 'depense')
+        var_moyen = sum(v['moyen'] for v in par_cat.values())
+        var_min   = sum(v['min']   for v in par_cat.values())
+        var_max   = sum(v['max']   for v in par_cat.values())
+        rec_total = rec_total_ca_propre + mc_rec_total
 
         results.append({
-            'variable_moyen': total_moyen,
-            'variable_min': total_min,
-            'variable_max': total_max,
-            'recurrentes': rec_total,
-            'total_moyen': total_moyen + rec_total,
-            'total_min':   total_min   + rec_total,
-            'total_max':   total_max   + rec_total,
-            'par_categorie': par_cat
+            'variable_moyen': var_moyen,
+            'variable_min':   var_min,
+            'variable_max':   var_max,
+            'recurrentes':    rec_total,
+            'total_moyen':    var_moyen + rec_total,
+            'total_min':      var_min   + rec_total,
+            'total_max':      var_max   + rec_total,
+            'par_categorie':  par_cat
         })
-
     return results
 
 

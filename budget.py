@@ -9,6 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import json
 import gspread
+import calendar
 from google.oauth2.service_account import Credentials
 from datetime import datetime, date
 from collections import defaultdict
@@ -63,48 +64,38 @@ def month_add(m, y, n):
 # ── Google Sheets ───────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_gsheet_client():
-    """Connexion au Google Sheet via les secrets Streamlit."""
     creds_dict = dict(st.secrets["gcp_service_account"])
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     return gspread.authorize(creds)
 
 def load_from_gsheet():
-    """Charge toutes les données depuis Google Sheets."""
     try:
         client = get_gsheet_client()
         sh = client.open(GSHEET_NAME)
         ws = sh.worksheet("data")
-
         values = ws.col_values(1)
         if values:
             payload = "".join(values)
             return json.loads(payload)
-
     except Exception as e:
         st.warning(f"Impossible de charger depuis Google Sheets : {e}")
-
     return get_default_data()
 
 def save_to_gsheet(data):
-    """Sauvegarde les données en plusieurs cellules pour éviter l'erreur 413."""
     try:
         client = get_gsheet_client()
         sh = client.open(GSHEET_NAME)
-
         try:
             ws = sh.worksheet("data")
         except gspread.WorksheetNotFound:
             ws = sh.add_worksheet(title="data", rows=2000, cols=2)
-
         payload = json.dumps(data, ensure_ascii=False)
         chunks = [payload[i:i+40000] for i in range(0, len(payload), 40000)]
-
         ws.clear()
         ws.update(
             range_name=f"A1:A{len(chunks)}",
             values=[[chunk] for chunk in chunks]
         )
-
     except Exception as e:
         st.error(f"Erreur de sauvegarde : {e}")
 
@@ -120,7 +111,6 @@ if 'fcpt' not in st.session_state:
 
 D = st.session_state.data
 
-# Migration : si cats est une liste de strings, convertir
 if D['cats'] and isinstance(D['cats'][0], str):
     D['cats'] = [{'nom': c, 'visible': True} for c in D['cats']]
 
@@ -128,7 +118,6 @@ def persist():
     save_to_gsheet(st.session_state.data)
 
 def visible_cats():
-    """Retourne les catégories visibles, triées alphabétiquement."""
     return sorted([c['nom'] for c in D['cats'] if c.get('visible', True)])
 
 def all_cats():
@@ -203,53 +192,181 @@ def month_net(cpt_id, m, y, forecast=False):
             past.append(sum(t['montant'] if t['type']=='revenu' else -t['montant'] for t in txs))
     return rec_n + (sum(past)/len(past) if past else 0)
 
-def build_forecast():
+# ── Prévisionnel refondu ────────────────────────────────────────────────────────
+def resolve_sol(cpt_id, m, y, depth=12):
     """
-    Prévisionnel 12 mois glissants.
-    MC : affiché comme débit sur CA le 1er du mois suivant (pas comme compte séparé).
+    Retourne (solde_debut_mois, source) en remontant l'historique si nécessaire.
+    source = 'saisi' | 'calculé' | None
+    """
+    v = get_sol(cpt_id, m, y)
+    if v is not None:
+        return v, 'saisi'
+    if depth <= 0:
+        return None, None
+    pm, py = month_add(m, y, -1)
+    base, src = resolve_sol(cpt_id, pm, py, depth - 1)
+    if base is None:
+        return None, None
+    # Mouvements directs du compte sur le mois pm
+    mvt = sum(t['montant'] if t['type'] == 'revenu' else -t['montant']
+              for t in D['tx'] if t['compte'] == cpt_id and aff_key(t) == (py, pm))
+    # Pour CA : soustraire le cumul MC affecté au mois pm (prélevé en fin de mois)
+    if cpt_id == 'ca':
+        mc_total = sum(t['montant'] for t in D['tx']
+                       if t['compte'] == 'mc' and t['type'] == 'depense'
+                       and aff_key(t) == (py, pm))
+        mvt -= mc_total
+    return base + mvt, 'calculé'
+
+
+def build_forecast_v2():
+    """
+    Prévisionnel refondu.
+
+    Passé (-6 mois à aujourd'hui) :
+      - Courbe jour par jour (1 point / jour calendaire)
+      - CA & MB : TX réelles du compte cumulées depuis solde début
+      - MC : cumul mensuel soustrait le DERNIER jour du mois d'affectation sur CA uniquement
+
+    Mois courant :
+      - Réel jusqu'à aujourd'hui + récurrentes restantes projetées
+
+    Futur (+1 à +5 mois) :
+      - 1 point par mois = solde fin estimé
+      - base = solde fin mois précédent + rec_net + moyenne TX non-rec passées - MC rec (CA)
+
+    Retourne :
+      months         : liste (m, y) 0-indexed, 12 éléments
+      daily_series   : { 'ca': [(date_str, solde), ...], 'mb': [...] }
+      monthly_series : { 'ca': [(label, valeur, is_forecast), ...], 'mb': [...] }
+      warnings       : [str, ...]
     """
     now = datetime.now()
     cm, cy = now.month - 1, now.year
+
     months = [month_add(cm, cy, i) for i in range(-6, 6)]
-    series = {}
+    warnings_out = []
+    daily_series = {'ca': [], 'mb': []}
+    monthly_series = {'ca': [], 'mb': []}
 
-    for cpt_id in ['ca', 'mb']:  # MC exclus du prévisionnel
-        base = get_sol(cpt_id, cm, cy) or 0
-        nets = []
-        for i, (m, y) in enumerate(months):
-            rel = i - 6
-            if rel < 0:
-                n = month_net(cpt_id, m, y)
-            elif rel == 0:
-                actual = month_net(cpt_id, m, y)
-                proj = sum(r['mnt'] if r['type']=='revenu' else -r['mnt']
-                           for r in D['rec'] if r['compte'] == cpt_id
-                           and r['jour'] > now.day
-                           and not rec_applied(r['id'], m, y))
-                n = actual + proj
-            else:
-                n = month_net(cpt_id, m, y, forecast=True)
+    for cpt_id in ['ca', 'mb']:
+        # Solde de départ : début du mois le plus ancien (-6)
+        start_m, start_y = months[0]
+        base_sol, src = resolve_sol(cpt_id, start_m, start_y)
+        if base_sol is None:
+            warnings_out.append(
+                f"⚠️ Aucun solde historique trouvé pour **{COMPTES[cpt_id]['label']}** "
+                f"— courbe calculée depuis 0 €."
+            )
+            base_sol = 0.0
 
-            # Pour CA : ajouter le débit MC du mois précédent (prélèvement en début de mois)
+        # ── Courbe journalière : mois -6 à mois courant ────────────────────
+        daily_pts = []
+        sol_running = base_sol
+
+        for idx in range(7):  # indices 0 (mois-6) à 6 (mois courant)
+            m, y = months[idx]
+            is_current = (idx == 6)
+            last_day = calendar.monthrange(y, m + 1)[1]
+
+            # TX directes du compte sur ce mois (date réelle pour CA/MB)
+            tx_direct = [
+                t for t in D['tx']
+                if t['compte'] == cpt_id
+                and datetime.strptime(t['date'], '%Y-%m-%d').year == y
+                and datetime.strptime(t['date'], '%Y-%m-%d').month == m + 1
+            ]
+
+            # Cumul MC affecté à ce mois (soustrait le dernier jour sur CA)
+            mc_cumul = 0.0
             if cpt_id == 'ca':
-                prev_m, prev_y = month_add(m, y, -1)
-                mc_debit = sum(t['montant'] for t in tx_of_month(prev_m, prev_y)
-                               if t['compte'] == 'mc' and t['type'] == 'depense')
-                if rel > 0:
-                    mc_debit_fc = sum(r['mnt'] for r in D['rec'] if r['compte'] == 'mc' and r['type'] == 'depense')
-                    mc_debit = mc_debit_fc + month_net('mc', prev_m, prev_y, True) * (-1)
-                    mc_debit = max(0, mc_debit)
-                n -= mc_debit
+                mc_cumul = sum(
+                    t['montant'] for t in D['tx']
+                    if t['compte'] == 'mc' and t['type'] == 'depense'
+                    and aff_key(t) == (y, m)
+                )
 
-            nets.append(n)
+            # Deltas par jour
+            daily_delta = defaultdict(float)
+            for t in tx_direct:
+                d_obj = datetime.strptime(t['date'], '%Y-%m-%d')
+                delta = t['montant'] if t['type'] == 'revenu' else -t['montant']
+                daily_delta[d_obj.day] += delta
 
-        opens = [0.0] * 12
-        opens[6] = base
-        for i in range(7, 12): opens[i] = opens[i-1] + nets[i-1]
-        for j in range(4, -1, -1): opens[j] = opens[j+1] - nets[j]
-        series[cpt_id] = {'closes': [opens[i] + nets[i] for i in range(12)]}
+            # Mois courant : projeter récurrentes non encore appliquées
+            if is_current:
+                for r in D['rec']:
+                    if r['compte'] == cpt_id and r['jour'] > now.day and not rec_applied(r['id'], m, y):
+                        delta = r['mnt'] if r['type'] == 'revenu' else -r['mnt']
+                        daily_delta[r['jour']] += delta
+                if cpt_id == 'ca':
+                    # Ajouter MC récurrentes non encore prélevées ce mois
+                    mc_rec = sum(r['mnt'] for r in D['rec']
+                                 if r['compte'] == 'mc' and r['type'] == 'depense'
+                                 and not rec_applied(r['id'], m, y))
+                    mc_cumul += mc_rec
 
-    return months, series
+            # Construire point par jour
+            sol_day = sol_running
+            for day in range(1, last_day + 1):
+                sol_day += daily_delta.get(day, 0.0)
+                if day == last_day and mc_cumul > 0 and cpt_id == 'ca':
+                    sol_day -= mc_cumul
+                day_str = f"{y}-{m+1:02d}-{day:02d}"
+                daily_pts.append((day_str, round(sol_day, 2)))
+
+            sol_running = sol_day  # fin de mois = départ mois suivant
+
+        daily_series[cpt_id] = daily_pts
+
+        # ── Points mensuels (12 mois) ──────────────────────────────────────
+        # Moyenne TX non-récurrentes sur les 6 derniers mois passés
+        past_nets = []
+        for i in range(6):
+            pm2, py2 = months[i]
+            non_rec = [t for t in D['tx']
+                       if t['compte'] == cpt_id
+                       and aff_key(t) == (py2, pm2)
+                       and not t.get('recId')]
+            if non_rec:
+                net = sum(t['montant'] if t['type'] == 'revenu' else -t['montant']
+                          for t in non_rec)
+                past_nets.append(net)
+        avg_non_rec = sum(past_nets) / len(past_nets) if past_nets else 0.0
+
+        rec_net = sum(r['mnt'] if r['type'] == 'revenu' else -r['mnt']
+                      for r in D['rec'] if r['compte'] == cpt_id)
+        mc_rec_monthly = sum(r['mnt'] for r in D['rec']
+                             if r['compte'] == 'mc' and r['type'] == 'depense') \
+                         if cpt_id == 'ca' else 0.0
+
+        monthly_pts = []
+        for idx in range(12):
+            m, y = months[idx]
+            rel = idx - 6
+            label = f"{MOIS_COURT[m]} {y}"
+
+            if rel <= 0:
+                # Passé + mois courant : lire depuis courbe journalière
+                prefix = f"{y}-{m+1:02d}-"
+                pts_m = [(ds, sv) for ds, sv in daily_series[cpt_id] if ds.startswith(prefix)]
+                val = pts_m[-1][1] if pts_m else None
+                is_fc = False
+            else:
+                # Futur
+                prev_val = monthly_pts[-1][1] if monthly_pts else None
+                if prev_val is None:
+                    val = None
+                else:
+                    val = prev_val + rec_net + avg_non_rec - mc_rec_monthly
+                is_fc = True
+
+            monthly_pts.append((label, val, is_fc))
+
+        monthly_series[cpt_id] = monthly_pts
+
+    return months, daily_series, monthly_series, warnings_out
+
 
 # ── CSS ─────────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -590,38 +707,125 @@ with tabs[4]:
             persist(); st.success("✓"); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PRÉVISIONNEL
+# PRÉVISIONNEL — refondu
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[5]:
-    st.subheader("Prévisionnel 12 mois — CA & Monabanq")
-    st.caption("MC exclue (avance de trésorerie soldée en début de mois suivant sur CA) · Pointillé = prévisionnel")
-    months, series = build_forecast()
-    labels = [f"{'~' if i>6 else ''}{MOIS_COURT[m]} {y}" for i,(m,y) in enumerate(months)]
-    fig = go.Figure()
-    fig.add_hrect(y0=min(min(s['closes']) for s in series.values())*1.1, y1=0,
-                  fillcolor="rgba(220,50,50,0.05)", line_width=0)
-    for cpt_id, cpt in {k:v for k,v in COMPTES.items() if k!='mc'}.items():
-        closes = series[cpt_id]['closes']
-        fig.add_trace(go.Scatter(x=labels[:7], y=closes[:7], mode='lines+markers',
-                                 name=cpt['label'], line=dict(color=cpt['color'],width=2),
-                                 fill='tozeroy', fillcolor=f"rgba({int(cpt['color'][1:3],16)},{int(cpt['color'][3:5],16)},{int(cpt['color'][5:7],16)},0.05)"))
-        fig.add_trace(go.Scatter(x=labels[6:], y=closes[6:], mode='lines+markers',
-                                 showlegend=False, line=dict(color=cpt['color'],width=1.5,dash='dot')))
-        od_val = D['overdraft'].get(cpt_id,0)
-        if od_val>0:
-            fig.add_hline(y=-od_val, line_dash="dash", line_color=cpt['color'],
-                          line_width=1, opacity=0.4,
-                          annotation_text=f"Découvert {cpt['label'].split()[0]}", annotation_position="right")
-    fig.add_vline(x=labels[6], line_dash="dot", line_color="gray", line_width=1.5)
-    fig.update_layout(height=400, hovermode='x unified', margin=dict(t=40,b=60,l=60,r=20),
-                      legend=dict(orientation="h",yanchor="bottom",y=-0.25,xanchor="center",x=0.5),
-                      yaxis_title="Solde (€)")
-    st.plotly_chart(fig, width="stretch")
-    df_fc = pd.DataFrame(
-        {COMPTES[c]['label'].split()[0]: [f"{'~' if i>6 else ''}{round(series[c]['closes'][i])}" for i in range(12)]
-         for c in ['ca','mb']},
-        index=labels
+    st.subheader("Prévisionnel — CA & Monabanq")
+    st.caption(
+        "**Passé** : courbe journalière réelle · MC cumulée soustraite fin de mois d'affectation sur CA  |  "
+        "**Futur** : solde fin de mois estimé (récurrentes + moyenne TX passées)"
     )
+
+    months, daily_series, monthly_series, fc_warnings = build_forecast_v2()
+
+    for w in fc_warnings:
+        st.warning(w)
+
+    now_str = datetime.now().strftime('%Y-%m-%d')
+    now_label = datetime.now().strftime('%d/%m/%Y')
+
+    fig = go.Figure()
+
+    # Zone rouge sous 0
+    all_vals = [v for s in monthly_series.values() for _, v, _ in s if v is not None]
+    y_min = min(all_vals) * 1.15 if all_vals else -1000
+
+    fig.add_hrect(y0=y_min, y1=0, fillcolor="rgba(220,50,50,0.04)", line_width=0)
+
+    for cpt_id in ['ca', 'mb']:
+        cpt = COMPTES[cpt_id]
+        color = cpt['color']
+        r_int = int(color[1:3], 16)
+        g_int = int(color[3:5], 16)
+        b_int = int(color[5:7], 16)
+
+        # ── Courbe journalière passé ────────────────────────────────────────
+        daily_pts = daily_series[cpt_id]
+        if daily_pts:
+            dates_past = [dp[0] for dp in daily_pts if dp[0] <= now_str]
+            vals_past  = [dp[1] for dp in daily_pts if dp[0] <= now_str]
+            if dates_past:
+                fig.add_trace(go.Scatter(
+                    x=dates_past, y=vals_past,
+                    mode='lines',
+                    name=cpt['label'],
+                    line=dict(color=color, width=2),
+                    fill='tozeroy',
+                    fillcolor=f"rgba({r_int},{g_int},{b_int},0.07)",
+                    hovertemplate='%{x}<br>%{y:,.0f} €<extra>' + cpt['label'] + '</extra>'
+                ))
+
+            # Projection mois courant (pointillé léger)
+            dates_proj = [dp[0] for dp in daily_pts if dp[0] >= now_str]
+            vals_proj  = [dp[1] for dp in daily_pts if dp[0] >= now_str]
+            if dates_proj:
+                fig.add_trace(go.Scatter(
+                    x=dates_proj, y=vals_proj,
+                    mode='lines',
+                    name=f"{cpt['label']} (projection mois courant)",
+                    showlegend=False,
+                    line=dict(color=color, width=1.5, dash='dot'),
+                    hovertemplate='%{x}<br>%{y:,.0f} €<extra>Projection</extra>'
+                ))
+
+        # ── Points mensuels futurs ──────────────────────────────────────────
+        fc_pts = [(label, val) for label, val, is_fc in monthly_series[cpt_id] if is_fc and val is not None]
+        # Ajouter le dernier point réel comme ancrage
+        real_pts = [(label, val) for label, val, is_fc in monthly_series[cpt_id] if not is_fc and val is not None]
+        anchor = [real_pts[-1]] if real_pts else []
+        fc_with_anchor = anchor + fc_pts
+        if len(fc_with_anchor) > 1:
+            fig.add_trace(go.Scatter(
+                x=[p[0] for p in fc_with_anchor],
+                y=[p[1] for p in fc_with_anchor],
+                mode='lines+markers',
+                name=f"{cpt['label']} (prévisionnel)",
+                showlegend=False,
+                line=dict(color=color, width=1.5, dash='dot'),
+                marker=dict(size=7, symbol='circle-open'),
+                hovertemplate='%{x}<br>%{y:,.0f} €<extra>Prévisionnel</extra>'
+            ))
+
+        # Ligne découvert
+        od_val = D['overdraft'].get(cpt_id, 0)
+        if od_val > 0:
+            fig.add_hline(
+                y=-od_val,
+                line_dash="dash", line_color=color, line_width=1, opacity=0.5,
+                annotation_text=f"Découvert {cpt['label'].split()[0]}",
+                annotation_position="bottom right"
+            )
+
+    # Ligne verticale aujourd'hui
+    fig.add_vline(
+        x=now_str,
+        line_dash="dot", line_color="gray", line_width=1.5,
+        annotation_text=f"Aujourd'hui", annotation_position="top right"
+    )
+
+    fig.update_layout(
+        height=430,
+        hovermode='x unified',
+        margin=dict(t=40, b=60, l=60, r=20),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
+        yaxis_title="Solde (€)",
+        xaxis_title="",
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    # ── Tableau récapitulatif ───────────────────────────────────────────────
+    st.markdown("**Tableau mensuel**")
+    table_rows = {}
+    for cpt_id in ['ca', 'mb']:
+        label_cpt = COMPTES[cpt_id]['label'].split()[0]
+        table_rows[label_cpt] = []
+        for lbl, val, is_fc in monthly_series[cpt_id]:
+            prefix = "~" if is_fc else ""
+            cell = f"{prefix}{round(val):,} €".replace(",", "\u202f") if val is not None else "—"
+            table_rows[label_cpt].append(cell)
+
+    col_labels = [lbl for lbl, _, _ in monthly_series['ca']]
+    df_fc = pd.DataFrame(table_rows, index=col_labels)
     st.dataframe(df_fc, width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -669,7 +873,7 @@ with tabs[6]:
 with tabs[7]:
     st.subheader("Catégories")
     st.caption("Les catégories invisibles n'apparaissent plus dans les listes déroulantes mais les transactions existantes sont conservées.")
-    
+
     vis_count = sum(1 for c in D['cats'] if c.get('visible',True))
     st.info(f"**{vis_count}** visibles sur **{len(D['cats'])}** total")
 

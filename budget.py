@@ -996,6 +996,7 @@ with tabs[3]:
             tx_cat = st.selectbox("Catégorie", visible_cats())
             tx_mnt = st.number_input("Montant (€)", min_value=0.01, step=0.01, format="%.2f")
             tx_note = st.text_input("Note", placeholder="Description…")
+            tx_exc = st.checkbox("⭐ Exceptionnelle (exclue du prévisionnel)", value=False)
         aff_m = aff_y = None
         if tx_cpt == 'mc':
             m1,m2 = st.columns(2)
@@ -1008,6 +1009,7 @@ with tabs[3]:
                       'type':tx_type, 'note':tx_note}
             if tx_cpt=='mc' and aff_m is not None:
                 new_tx['affM'] = aff_m; new_tx['affY'] = aff_y
+            if tx_exc: new_tx['exceptionnel'] = True
             D['tx'].append(new_tx); persist()
             st.success(f"✓ {COMPTES[tx_cpt]['label']} — {fmt2(tx_mnt)} — {tx_cat}")
             st.rerun()

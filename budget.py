@@ -112,6 +112,8 @@ if 'cur_y' not in st.session_state:
     st.session_state.cur_y = datetime.now().year
 if 'fcpt' not in st.session_state:
     st.session_state.fcpt = 'all'
+if 'last_saisie_cpt' not in st.session_state:
+    st.session_state.last_saisie_cpt = 'ca'
 
 D = st.session_state.data
 
@@ -970,11 +972,23 @@ with tabs[2]:
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[3]:
     st.subheader("Ajouter une transaction")
+    # Sélection compte HORS formulaire → persiste entre saisies
+    cpt_keys = list(COMPTES.keys())
+    tx_cpt = st.selectbox(
+        "Compte", cpt_keys,
+        index=cpt_keys.index(st.session_state.last_saisie_cpt),
+        format_func=lambda x: COMPTES[x]['label'],
+        key="saisie_cpt_select"
+    )
+    if tx_cpt != st.session_state.last_saisie_cpt:
+        st.session_state.last_saisie_cpt = tx_cpt
+        st.rerun()
+    if tx_cpt == 'mc':
+        st.info("💳 **Mastercard débit différé** — le mois d'affectation est demandé ci-dessous.")
     with st.form("add_tx", clear_on_submit=True):
         fc1,fc2 = st.columns(2)
         with fc1:
             tx_date = st.date_input("Date (JJ/MM/AAAA)", value=date.today(), format="DD/MM/YYYY")
-            tx_cpt = st.selectbox("Compte", list(COMPTES.keys()), format_func=lambda x: COMPTES[x]['label'])
             tx_type = st.radio("Type", ['depense','revenu'],
                                format_func=lambda x: '💸 Dépense' if x=='depense' else '💰 Revenu',
                                horizontal=True)
@@ -984,9 +998,8 @@ with tabs[3]:
             tx_note = st.text_input("Note", placeholder="Description…")
         aff_m = aff_y = None
         if tx_cpt == 'mc':
-            st.info("💳 **Mastercard débit différé** — mois d'affectation :")
             m1,m2 = st.columns(2)
-            aff_m = m1.selectbox("Mois", range(12), index=datetime.now().month-1, format_func=lambda x: MOIS[x])
+            aff_m = m1.selectbox("Mois affectation", range(12), index=datetime.now().month-1, format_func=lambda x: MOIS[x])
             aff_y = m2.selectbox("Année", [2024,2025,2026,2027], index=2)
         if st.form_submit_button("✅ Ajouter", type="primary", width="stretch"):
             new_tx = {'id':f"tx_{int(datetime.now().timestamp()*1000)}",
@@ -996,7 +1009,8 @@ with tabs[3]:
             if tx_cpt=='mc' and aff_m is not None:
                 new_tx['affM'] = aff_m; new_tx['affY'] = aff_y
             D['tx'].append(new_tx); persist()
-            st.success(f"✓ {fmt2(tx_mnt)} — {tx_cat}"); st.rerun()
+            st.success(f"✓ {COMPTES[tx_cpt]['label']} — {fmt2(tx_mnt)} — {tx_cat}")
+            st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # RÉCURRENTES

@@ -1518,9 +1518,9 @@ with tabs[5]:
     # Ligne verticale aujourd'hui
     today_lbl = f"{MOIS_COURT[now_pv.month-1]} {now_pv.year}"
     if today_lbl in labels_g:
-        fig_g.add_vline(x=today_lbl, line_dash="dot", line_color="gray",
-                        line_width=1.5, annotation_text="Aujourd'hui",
-                        annotation_position="top right")
+        fig_g.add_shape(type='line', x0=today_lbl, x1=today_lbl, y0=0, y1=1,
+                        xref='x', yref='paper',
+                        line=dict(dash='dot', color='gray', width=1.5))
 
     fig_g.update_layout(
         barmode='group',
@@ -1657,7 +1657,9 @@ with tabs[5]:
                                 line_width=1, opacity=0.4,
                                 annotation_text="Découvert max", annotation_position="bottom right")
             if today_lbl in labels:
-                fig_d.add_vline(x=today_lbl, line_dash="dot", line_color="gray", line_width=1.5)
+                fig_d.add_shape(type='line', x0=today_lbl, x1=today_lbl, y0=0, y1=1,
+                                xref='x', yref='paper',
+                                line=dict(dash='dot', color='gray', width=1.5))
 
             fig_d.update_layout(
                 title=dict(text=cpt['label'], font=dict(size=13)),

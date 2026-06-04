@@ -322,41 +322,51 @@ def resolve_sol(cpt_id, target_m, target_y):
 def prevision_depenses(cpt_id, mois_cibles):
     """
     Prévision des dépenses variables par catégorie.
-    - Exclut : virements internes, catégories récurrentes connues
-    - Filtre IQR : exclut les valeurs aberrantes (outliers) par catégorie
-    - Modèle combiné : EWM + tendance linéaire + saisonnalité
-    - MC : incluse dans l'historique CA mais PAS dans rec_total (évite double comptage)
+
+    Logique "résidu récurrent" :
+      Pour chaque catégorie qui contient des récurrentes connues (ex. Prêt/Assurance),
+      on soustrait le montant fixe récurrent mensuel de l'historique observé.
+      Ce qui reste = dépenses imprévues dans cette catégorie.
+      Le total final = récurrentes fixes + résidu variable estimé.
+
+    Ainsi "Prêt/Assurance" à 606€ estimé dont 580€ de récurrentes → résidu = 26€.
     """
     now = datetime.now()
     cm, cy = now.month - 1, now.year
 
-    # Catégories à exclure du variable (ne reflètent pas une vraie dépense nette)
     CATS_EXCLUES = CATS_NEUTRES
 
-    # Récurrentes connues : leurs catégories sont fixes → exclues du variable
-    rec_ids = {r['id'] for r in D['rec']}
+    # Montant mensuel fixe des récurrentes par catégorie pour ce compte
+    # (hors MC qui est traitée séparément)
+    rec_par_cat = defaultdict(float)
+    for r in D['rec']:
+        if r['compte'] == cpt_id and r['type'] == 'depense':
+            rec_par_cat[r['cat']] += r['mnt']
+    # Pour CA : ajouter les récurrentes MC par catégorie
+    if cpt_id == 'ca':
+        for r in D['rec']:
+            if r['compte'] == 'mc' and r['type'] == 'depense':
+                rec_par_cat[r['cat']] += r['mnt']
 
-    # Historique mensuel variable par catégorie (18 mois max)
+    # Historique mensuel par catégorie (18 mois max)
+    # On collecte TOUTES les TX non-exceptionnelles (y compris celles avec recId)
+    # car les récurrentes passées font partie de l'historique réel
     hist_months = [month_add(cm, cy, -i) for i in range(1, 19)]
     hist_months.reverse()
 
     hist = defaultdict(list)
     for m, y in hist_months:
         abs_m = y * 12 + m
-        # TX directes du compte (hors récurrentes, hors catégories exclues)
         tx_m = [t for t in D['tx']
                 if t['compte'] == cpt_id
                 and aff_key(t) == (y, m)
                 and t['type'] == 'depense'
-                and not t.get('recId')
                 and not t.get('exceptionnel', False)
                 and t.get('categorie') not in CATS_EXCLUES]
-        # Pour CA : inclure TX MC non-récurrentes affectées à ce mois
         if cpt_id == 'ca':
             tx_m += [t for t in D['tx']
                      if t['compte'] == 'mc'
                      and t['type'] == 'depense'
-                     and not t.get('recId')
                      and not t.get('exceptionnel', False)
                      and t.get('categorie') not in CATS_EXCLUES
                      and aff_key(t) == (y, m)]
@@ -364,7 +374,9 @@ def prevision_depenses(cpt_id, mois_cibles):
         for t in tx_m:
             cat_totals[t['categorie']] += t['montant']
         for cat, total in cat_totals.items():
-            hist[cat].append((abs_m, total))
+            # Soustraire la part fixe récurrente pour ne garder que le résidu
+            residu = max(0.0, total - rec_par_cat.get(cat, 0.0))
+            hist[cat].append((abs_m, residu))
 
     # Filtre IQR par catégorie : exclure les mois aberrants (outliers)
     def filter_iqr(data):
@@ -457,6 +469,27 @@ def prevision_depenses(cpt_id, mois_cibles):
         var_max   = sum(v['max']   for v in par_cat.values())
         rec_total = rec_total_ca_propre + mc_rec_total
 
+        # Enrichir par_cat avec la part fixe récurrente pour l'affichage
+        par_cat_affich = {}
+        for cat in par_cat:
+            part_fixe = rec_par_cat.get(cat, 0.0)
+            d = par_cat[cat]
+            par_cat_affich[cat] = {
+                'moyen':    d['moyen'] + part_fixe,   # total = fixe + résidu
+                'min':      d['min']   + part_fixe,
+                'max':      d['max']   + part_fixe,
+                'tendance': d['tendance'],
+                'fixe':     part_fixe,                # part fixe pour info
+                'residu':   d['moyen'],               # résidu variable estimé
+            }
+        # Catégories purement récurrentes sans TX variables : les ajouter aussi
+        for cat, fixe in rec_par_cat.items():
+            if cat not in par_cat_affich and cat not in CATS_EXCLUES:
+                par_cat_affich[cat] = {
+                    'moyen': fixe, 'min': fixe, 'max': fixe,
+                    'tendance': 'stable', 'fixe': fixe, 'residu': 0.0
+                }
+
         results.append({
             'variable_moyen': var_moyen,
             'variable_min':   var_min,
@@ -465,7 +498,7 @@ def prevision_depenses(cpt_id, mois_cibles):
             'total_moyen':    var_moyen + rec_total,
             'total_min':      var_min   + rec_total,
             'total_max':      var_max   + rec_total,
-            'par_categorie':  par_cat
+            'par_categorie':  par_cat_affich
         })
     return results
 
@@ -1833,18 +1866,29 @@ with tabs[5]:
                             )
                         # Dépenses variables estimées par catégorie
                         if r["fc_detail"]:
-                            st.markdown("<div style='margin-top:8px;font-size:12px;color:#888'>Variables estimées :</div>",
+                            st.markdown("<div style='margin-top:8px;font-size:12px;color:#888'>Dépenses estimées par catégorie :</div>",
                                         unsafe_allow_html=True)
                             for cat, d in sorted(r["fc_detail"].items(), key=lambda x: -x[1]["moyen"]):
                                 if d["moyen"] < 1: continue
                                 icon = TENDANCE_ICON.get(d["tendance"], "?")
+                                fixe = d.get("fixe", 0.0)
+                                residu = d.get("residu", d["moyen"])
+                                # Badge décomposition si part fixe connue
+                                if fixe > 0 and residu > 0:
+                                    detail_str = (f"<small style='color:#aaa'>"
+                                                  f"fixe {fmt(fixe)} + imprévus ~{fmt(residu)}"
+                                                  f"</small>")
+                                elif fixe > 0:
+                                    detail_str = f"<small style='color:#aaa'>fixe</small>"
+                                else:
+                                    detail_str = (f"<small style='color:#aaa'>"
+                                                  f"[{fmt(d['min'])}–{fmt(d['max'])}]"
+                                                  f"</small>")
                                 st.markdown(
                                     f"<div style='display:flex;justify-content:space-between;"
                                     f"padding:3px 0;border-bottom:1px solid #f5f5f5;font-size:12px;color:#555'>"
                                     f"<span>{icon} {cat}</span>"
-                                    f"<span>−{fmt(d['moyen'])} "
-                                    f"<small style='color:#aaa'>[{fmt(d['min'])}–{fmt(d['max'])}]</small>"
-                                    f"</span></div>",
+                                    f"<span>−{fmt(d['moyen'])} {detail_str}</span></div>",
                                     unsafe_allow_html=True
                                 )
                         st.markdown(f"**Total estimé : −{fmt(r['sorties'])}**")

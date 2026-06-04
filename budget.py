@@ -140,6 +140,28 @@ if 'fcpt' not in st.session_state:
 if 'last_saisie_cpt' not in st.session_state:
     st.session_state.last_saisie_cpt = 'ca'
 
+# Budget cible par défaut (résidus 2024 après déduction récurrentes)
+BUDGET_CIBLE_DEFAULT = {
+    'ca': {
+        'Nourriture': 108, 'Frais divers': 170, 'Habit / Beauté': 19,
+        'Loisirs / Vacances': 621, 'CLAE / École': 1, 'Voiture': 0,
+        'Abonnement': 0, 'Santé': 48, 'Sénégal': 0, 'Divers': 500,
+    },
+    'mb': {
+        'Nourriture': 319, 'Frais divers': 40, 'Habit / Beauté': 65,
+        'Loisirs / Vacances': 266, 'CLAE / École': 339, 'Voiture': 130,
+        'Abonnement': 0, 'Santé': 66, 'Sénégal': 218, 'Divers': 400,
+        'Prêt / Assurance': 335,
+    },
+}
+# Revenu cible mensuel par compte (0 = utiliser historique réel)
+REVENU_CIBLE_DEFAULT = {'ca': 0, 'mb': 0}
+# Charger depuis D si existe, sinon default
+if 'budget_cible' not in D:
+    D['budget_cible'] = BUDGET_CIBLE_DEFAULT
+if 'revenu_cible' not in D:
+    D['revenu_cible'] = REVENU_CIBLE_DEFAULT
+
 D = st.session_state.data
 
 if D['cats'] and isinstance(D['cats'][0], str):
@@ -388,14 +410,22 @@ def prevision_depenses(cpt_id, mois_cibles):
         lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
         return [(a, v) for a, v in data if lo <= v <= hi]
 
+    # Budget cible pour ce compte (résidu variable de référence)
+    budget_cible_cpt = D.get('budget_cible', {}).get(cpt_id, {})
+
     def predict_cat(cat, target_m, target_y):
         raw = sorted(hist.get(cat, []), key=lambda x: x[0])
         data = filter_iqr(raw)
         n = len(data)
+        # Fallback : budget cible si historique insuffisant
+        cible = float(budget_cible_cpt.get(cat, 0))
         if n == 0:
-            # Si tout a été filtré, prendre la médiane brute
             if raw:
-                return float(np.median([v for _, v in raw])), 0.0, float(np.median([v for _, v in raw]))
+                med = float(np.median([v for _, v in raw]))
+                # Combiner médiane brute et budget cible
+                return (med + cible) / 2 if cible > 0 else med, 0.0, (med + cible) / 2 if cible > 0 else med
+            if cible > 0:
+                return cible, cible * 0.7, cible * 1.3
             return 0.0, 0.0, 0.0
 
         vals = np.array([v for _, v in data])
@@ -434,6 +464,14 @@ def prevision_depenses(cpt_id, mois_cibles):
         else:
             pred = w_ewm * ewm + w_trend * trend_val
         pred = max(0.0, pred)
+
+        # Fusion avec le budget cible : plus de poids sur le cible quand peu d'historique
+        cible = float(budget_cible_cpt.get(cat, 0))
+        if cible > 0 and n < 6:
+            # Poids budget cible : 80% si 1 mois, 50% si 3 mois, 0% si 6+ mois
+            w_cible = max(0.0, (6 - n) / 6 * 0.8)
+            pred = (1 - w_cible) * pred + w_cible * cible
+            pred = max(0.0, pred)
 
         # Intervalle de confiance
         if n >= 2:
@@ -622,6 +660,14 @@ def build_forecast_v2():
             avg_rev_var = float(np.average(past_rev_nets, weights=w))
         else:
             avg_rev_var = 0.0
+
+        # Fusion avec le revenu cible si saisi
+        rev_cible = float(D.get('revenu_cible', {}).get(cpt_id, 0))
+        if rev_cible > 0:
+            n_rev_hist = len(past_rev_nets)
+            w_cible_rev = max(0.0, (6 - n_rev_hist) / 6)
+            avg_rev_var = (1 - w_cible_rev) * avg_rev_var + w_cible_rev * rev_cible
+            avg_rev_var = max(0.0, avg_rev_var)
 
         rev_futur = rec_rev + avg_rev_var
 
@@ -815,7 +861,7 @@ TX_CUR = [t for t in tx_of_month(M, Y) if FCPT == 'all' or t['compte'] == FCPT]
 st.divider()
 
 tabs = st.tabs(["📍 Aujourd'hui","📊 Mois","📋 Transactions","✏️ Saisie",
-                "🔄 Récurrentes","📈 Prévisionnel","🏦 Prêts","🏷️ Catégories","🔬 Diagnostic","💾 Sauvegarde"])
+                "🔄 Récurrentes","📈 Prévisionnel","🏦 Prêts","🏷️ Catégories","🎯 Budget cible","🔬 Diagnostic","💾 Sauvegarde"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AUJOURD'HUI
@@ -1968,6 +2014,125 @@ with tabs[7]:
 # DIAGNOSTIC PRÉVISION
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[8]:
+    st.subheader("🎯 Budget cible mensuel")
+    st.caption(
+        "Définit le montant mensuel de référence pour chaque catégorie variable, "
+        "**par compte**. Utilisé par le prévisionnel quand l'historique est insuffisant (< 3 mois). "
+        "Pré-rempli avec les moyennes 2024 après déduction des récurrentes connues."
+    )
+
+    bc_cpt = st.radio("Compte", ['ca', 'mb'],
+                      format_func=lambda x: COMPTES[x]['label'],
+                      horizontal=True, key="bc_cpt")
+
+    bc = D.get('budget_cible', {})
+    bc_cpt_data = bc.get(bc_cpt, {})
+
+    st.markdown(f"**{COMPTES[bc_cpt]['label']}** — résidu variable mensuel estimé (hors récurrentes fixes)")
+
+    # Toutes les catégories visibles + celles déjà dans le budget cible
+    cats_bc = sorted(set(visible_cats()) | set(bc_cpt_data.keys()) - {'Virement interne', 'Épargne'})
+    
+    changed_bc = False
+    new_bc_data = dict(bc_cpt_data)
+
+    cols_bc = st.columns(3)
+    for i, cat in enumerate(cats_bc):
+        with cols_bc[i % 3]:
+            current = float(bc_cpt_data.get(cat, 0))
+            new_val = st.number_input(
+                cat,
+                value=current,
+                min_value=0.0,
+                step=10.0,
+                format="%.0f",
+                key=f"bc_{bc_cpt}_{cat}"
+            )
+            if new_val != current:
+                new_bc_data[cat] = new_val
+                changed_bc = True
+
+    if changed_bc:
+        if 'budget_cible' not in D:
+            D['budget_cible'] = {}
+        D['budget_cible'][bc_cpt] = new_bc_data
+        persist()
+        st.success("✓ Budget cible mis à jour")
+
+    st.divider()
+
+    # ── Revenu cible ──────────────────────────────────────────────────────
+    st.markdown("**💰 Revenu cible mensuel**")
+    st.caption(
+        "Si 0 → le modèle utilise la moyenne pondérée des revenus réels passés. "
+        "Utile pour anticiper une montée en charge CA ou un changement de situation."
+    )
+    rc_data = D.get('revenu_cible', REVENU_CIBLE_DEFAULT)
+    rc_current = float(rc_data.get(bc_cpt, 0))
+
+    rc_cols = st.columns([2, 1])
+    with rc_cols[0]:
+        rc_new = st.number_input(
+            f"Revenu mensuel cible — {COMPTES[bc_cpt]['label']} (0 = automatique)",
+            value=rc_current, min_value=0.0, step=50.0, format="%.0f",
+            key=f"rc_{bc_cpt}"
+        )
+    with rc_cols[1]:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if rc_new != rc_current:
+            if 'revenu_cible' not in D:
+                D['revenu_cible'] = dict(REVENU_CIBLE_DEFAULT)
+            D['revenu_cible'][bc_cpt] = rc_new
+            persist()
+            st.success("✓")
+
+    if rc_new > 0:
+        # Comptage mois d'historique revenus disponibles
+        now_rc = datetime.now()
+        cm_rc, cy_rc = now_rc.month - 1, now_rc.year
+        mois_rev = set()
+        for t in D['tx']:
+            if t['compte'] == bc_cpt and t['type'] == 'revenu' and not t.get('exceptionnel', False):
+                mois_rev.add(aff_key(t))
+        n_hist_rev = len([m for m in mois_rev
+                          if m[0]*12 + m[1] < cy_rc*12 + cm_rc])
+        w_cible_rev = max(0.0, (6 - n_hist_rev) / 6)
+        st.info(
+            f"📊 {n_hist_rev} mois d'historique revenus · "
+            f"Poids du cible dans le prévisionnel : **{int(w_cible_rev*100)}%** "
+            f"(diminue automatiquement à mesure que l'historique grandit)"
+        )
+
+    st.divider()
+    # ── Résumé ────────────────────────────────────────────────────────────
+    total_bc = sum(v for v in new_bc_data.values() if v > 0)
+    rec_dep_cpt = sum(r['mnt'] for r in D['rec'] if r['compte'] == bc_cpt and r['type'] == 'depense')
+    if bc_cpt == 'ca':
+        rec_dep_cpt += mc_rec_depenses()
+    rev_rec = sum(r['mnt'] for r in D['rec'] if r['compte'] == bc_cpt and r['type'] == 'revenu')
+    # Revenu total estimé = récurrentes + cible variable (si saisi)
+    rev_var_cible = rc_new if rc_new > 0 else 0
+    rev_total_estime = rev_rec + rev_var_cible
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Récurrentes fixes dép.", fmt(rec_dep_cpt))
+    c2.metric("Variables estimées dép.", fmt(total_bc))
+    c3.metric("Total sorties", fmt(rec_dep_cpt + total_bc))
+    c4.metric("Revenus estimés", fmt(rev_total_estime),
+              delta=f"+{fmt(rev_var_cible)} variable" if rev_var_cible > 0 else None)
+
+    solde_cible = rev_total_estime - rec_dep_cpt - total_bc
+    color_solde = "#1D9E75" if solde_cible >= 0 else "#E24B4A"
+    bg_solde = "#f0faf4" if solde_cible >= 0 else "#fdf0f0"
+    st.markdown(
+        f'<div style="border-radius:8px;padding:12px 16px;background:{bg_solde};margin-top:8px">'
+        f'Solde mensuel estimé : '
+        f'<strong style="font-size:18px;color:{color_solde}">{fmt(solde_cible)}</strong>'
+        f'</div>',
+        unsafe_allow_html=True
+    )
+
+with tabs[9]:
     st.subheader("🔬 Diagnostic — données utilisées par le modèle de prévision")
     st.caption("Vérifie ici exactement ce que le modèle voit pour chaque catégorie avant de prévoir.")
 
@@ -2130,7 +2295,7 @@ with tabs[8]:
                 rows_cat.append({'Mois': lbl, 'Montant': fmt(v), 'Statut IQR': flag})
             st.dataframe(pd.DataFrame(rows_cat).set_index('Mois'), width="stretch")
 
-with tabs[9]:
+with tabs[10]:
     st.subheader("💾 Sauvegarde & Restauration")
     bk1,bk2 = st.columns(2)
     with bk1:

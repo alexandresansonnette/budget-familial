@@ -1480,11 +1480,20 @@ with tabs[5]:
             fc_detail = None
 
             if not is_fc:
-                tx_m = [t for t in D['tx'] if t['compte']==cpt_id and aff_key(t)==(y, m)]
+                # Exclure les virements internes et épargne pour ne pas gonfler les barres
+                tx_m = [t for t in D['tx']
+                        if t['compte']==cpt_id
+                        and aff_key(t)==(y, m)
+                        and t.get('categorie') not in CATS_NEUTRES]
                 entrees = sum(t['montant'] for t in tx_m if t['type']=='revenu')
                 sorties = sum(t['montant'] for t in tx_m if t['type']=='depense')
                 if cpt_id == 'ca':
-                    sorties += mc_depenses_reelles(m, y)
+                    # MC : exclure aussi les virements internes MC
+                    mc_tx = [t for t in D['tx']
+                             if t['compte']=='mc' and t['type']=='depense'
+                             and aff_key(t)==(y, m)
+                             and t.get('categorie') not in CATS_NEUTRES]
+                    sorties += sum(t['montant'] for t in mc_tx)
                 sol_min = sol_max = None
             else:
                 fc = fc_list[fc_idx] if fc_idx < len(fc_list) else None

@@ -357,7 +357,8 @@ def prevision_depenses(cpt_id, mois_cibles):
     now = datetime.now()
     cm, cy = now.month - 1, now.year
 
-    CATS_EXCLUES = CATS_NEUTRES
+    # Catégories jamais estimées en dépense (revenus ou neutres)
+    CATS_EXCLUES = CATS_NEUTRES | {'ARE / Salaire', 'Allocations', 'Revenu freelance'}
 
     # Montant mensuel fixe des récurrentes DÉPENSES par catégorie
     # (récurrentes revenus exclues — elles n'ont rien à faire dans les dépenses)
@@ -467,10 +468,10 @@ def prevision_depenses(cpt_id, mois_cibles):
         pred = max(0.0, pred)
 
         # Fusion avec le budget cible : plus de poids sur le cible quand peu d'historique
+        # Seuil 12 mois : 80% cible si 1 mois d'historique, 0% à 12 mois
         cible = float(budget_cible_cpt.get(cat, 0))
-        if cible > 0 and n < 6:
-            # Poids budget cible : 80% si 1 mois, 50% si 3 mois, 0% si 6+ mois
-            w_cible = max(0.0, (6 - n) / 6 * 0.8)
+        if cible > 0 and n < 12:
+            w_cible = max(0.0, (12 - n) / 12 * 0.8)
             pred = (1 - w_cible) * pred + w_cible * cible
             pred = max(0.0, pred)
 
@@ -666,7 +667,7 @@ def build_forecast_v2():
         rev_cible = float(D.get('revenu_cible', {}).get(cpt_id, 0))
         if rev_cible > 0:
             n_rev_hist = len(past_rev_nets)
-            w_cible_rev = max(0.0, (6 - n_rev_hist) / 6)
+            w_cible_rev = max(0.0, (12 - n_rev_hist) / 12)
             avg_rev_var = (1 - w_cible_rev) * avg_rev_var + w_cible_rev * rev_cible
             avg_rev_var = max(0.0, avg_rev_var)
 
@@ -2142,7 +2143,7 @@ with tabs[9]:
 
     now_d = datetime.now()
     cm_d, cy_d = now_d.month - 1, now_d.year
-    CATS_EXCLUES_D = CATS_NEUTRES
+    CATS_EXCLUES_D = CATS_NEUTRES | {'ARE / Salaire', 'Allocations', 'Revenu freelance'}
     rec_ids_d = {r['id'] for r in D['rec']}
 
     # Reconstituer l'historique tel que vu par le modèle

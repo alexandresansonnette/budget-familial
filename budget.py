@@ -336,13 +336,13 @@ def prevision_depenses(cpt_id, mois_cibles):
 
     CATS_EXCLUES = CATS_NEUTRES
 
-    # Montant mensuel fixe des récurrentes par catégorie pour ce compte
-    # (hors MC qui est traitée séparément)
+    # Montant mensuel fixe des récurrentes DÉPENSES par catégorie
+    # (récurrentes revenus exclues — elles n'ont rien à faire dans les dépenses)
     rec_par_cat = defaultdict(float)
     for r in D['rec']:
         if r['compte'] == cpt_id and r['type'] == 'depense':
             rec_par_cat[r['cat']] += r['mnt']
-    # Pour CA : ajouter les récurrentes MC par catégorie
+    # Pour CA : ajouter les récurrentes MC dépenses par catégorie
     if cpt_id == 'ca':
         for r in D['rec']:
             if r['compte'] == 'mc' and r['type'] == 'depense':
@@ -469,26 +469,25 @@ def prevision_depenses(cpt_id, mois_cibles):
         var_max   = sum(v['max']   for v in par_cat.values())
         rec_total = rec_total_ca_propre + mc_rec_total
 
-        # Enrichir par_cat avec la part fixe récurrente pour l'affichage
+        # par_cat contient déjà les résidus (après soustraction de la part fixe).
+        # On n'affiche QUE le résidu variable estimé — les récurrentes fixes
+        # sont déjà listées séparément dans la section récurrentes au-dessus.
         par_cat_affich = {}
         for cat in par_cat:
-            part_fixe = rec_par_cat.get(cat, 0.0)
             d = par_cat[cat]
+            if d['moyen'] < 1.0:
+                continue  # résidu négligeable → pas la peine d'afficher
             par_cat_affich[cat] = {
-                'moyen':    d['moyen'] + part_fixe,   # total = fixe + résidu
-                'min':      d['min']   + part_fixe,
-                'max':      d['max']   + part_fixe,
+                'moyen':    d['moyen'],
+                'min':      d['min'],
+                'max':      d['max'],
                 'tendance': d['tendance'],
-                'fixe':     part_fixe,                # part fixe pour info
-                'residu':   d['moyen'],               # résidu variable estimé
+                'fixe':     0.0,
+                'residu':   d['moyen'],
             }
-        # Catégories purement récurrentes sans TX variables : les ajouter aussi
-        for cat, fixe in rec_par_cat.items():
-            if cat not in par_cat_affich and cat not in CATS_EXCLUES:
-                par_cat_affich[cat] = {
-                    'moyen': fixe, 'min': fixe, 'max': fixe,
-                    'tendance': 'stable', 'fixe': fixe, 'residu': 0.0
-                }
+        # Les catégories purement récurrentes (sans TX variables) ne sont PAS
+        # réaffichées dans par_cat : elles sont déjà listées dans la section
+        # récurrentes fixes au-dessus → évite le double affichage.
 
         results.append({
             'variable_moyen': var_moyen,

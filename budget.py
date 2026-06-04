@@ -641,19 +641,17 @@ def build_forecast_v2():
 
 def projection_fin_mois(cpt_id):
     """
-    Projette le solde jour par jour de aujourd'hui à la fin du mois courant.
+    Rejoue toutes les TX du mois depuis le solde de début de mois,
+    puis projette les événements futurs restants.
 
-    Logique des événements futurs :
-      1. Transactions déjà saisies avec date future (AVEC ou SANS recId)
-         → incluses telles quelles, elles représentent ce qui va sortir/rentrer
-      2. Récurrentes NON encore appliquées au mois (pas de TX avec ce recId)
-         → ajoutées à leur jour habituel
-         Attention : si une récurrente a déjà été appliquée (recId présent dans D['tx']),
-         elle est déjà comptée via le point 1, donc pas de doublon
-      3. MC restante sur CA : total MC affecté au mois entier
-         (passé + futur déjà saisi) moins ce qui a déjà été prélevé à ce jour
-         + MC récurrentes non encore appliquées
-         → prélevée le dernier jour du mois
+    Stratégie :
+      - Partir du solde saisi au 1er du mois (ou calculé via resolve_sol)
+      - Rejouer TOUTES les TX réelles du mois jusqu'à aujourd'hui (passé réel)
+      - Projeter les événements futurs :
+          * TX déjà saisies avec date future (hors récurrentes MC)
+          * Récurrentes non encore appliquées
+          * Prélèvement MC total en fin de mois
+      - La courbe montre ainsi le passé réel + le futur projeté
     """
     now = datetime.now()
     m, y = now.month - 1, now.year
@@ -661,61 +659,62 @@ def projection_fin_mois(cpt_id):
     od = D['overdraft'].get(cpt_id, 0)
     limite = -od
 
-    solde_act = solde_a_date(cpt_id)
-    if solde_act is None:
+    # Solde de début de mois
+    sol_debut, _ = resolve_sol(cpt_id, m, y)
+    if sol_debut is None:
         return {'solde_actuel': None, 'jours': [], 'solde_fin': None,
                 'point_bas': (None, None), 'point_bas_jour': None,
                 'manque': 0, 'statut': 'ok', 'od': od, 'marge': None}
 
-    daily_events = defaultdict(list)  # jour → [(nom, montant_signé)]
+    # Solde actuel calculé (pour l'affichage dans le bandeau)
+    solde_act = solde_a_date(cpt_id)
 
-    # ── 1. Toutes les transactions futures du mois déjà saisies ───────────
-    # (avec OU sans recId — elles sont déjà dans D['tx'] donc certaines)
+    # ── Construire les deltas jour par jour pour tout le mois ─────────────
+    daily_events = defaultdict(list)   # jour → [(nom, delta, is_future)]
+
+    # 1. TX réelles déjà saisies (passé ET futur avec date dans ce mois)
     for t in D['tx']:
+        if t['compte'] != cpt_id: continue
+        if aff_key(t) != (y, m): continue
         t_date = datetime.strptime(t['date'], '%Y-%m-%d')
-        if (t['compte'] == cpt_id
-                and aff_key(t) == (y, m)
-                and t_date.date() > now.date()):
-            delta = t['montant'] if t['type'] == 'revenu' else -t['montant']
-            nom = t.get('note') or t['categorie']
-            daily_events[t_date.day].append((nom, delta))
+        delta = t['montant'] if t['type'] == 'revenu' else -t['montant']
+        nom = t.get('note') or t['categorie']
+        is_future = t_date.date() > now.date()
+        daily_events[t_date.day].append((nom, delta, is_future))
 
-    # ── 2. Récurrentes NON encore appliquées (pas de doublon avec le point 1)
+    # 2. Récurrentes NON encore appliquées (pas encore dans D['tx'])
     for r in D['rec']:
         if r['compte'] == cpt_id and not rec_applied(r['id'], m, y):
-            # Seulement si le jour est dans le futur
-            if r['jour'] > now.day:
-                delta = r['mnt'] if r['type'] == 'revenu' else -r['mnt']
-                daily_events[r['jour']].append((r['nom'], delta))
+            delta = r['mnt'] if r['type'] == 'revenu' else -r['mnt']
+            daily_events[r['jour']].append((r['nom'], delta, True))
 
-    # ── 3. Prélèvement MC sur CA en fin de mois ──────────────────────────────
-    # La MC est un débit différé : toutes les dépenses du mois sont prélevées
-    # EN UNE SEULE FOIS sur le CA. On prend le TOTAL du mois sans soustraire
-    # mc_a_ce_jour — rien n'a encore été prélevé sur le CA à ce stade.
+    # 3. Prélèvement MC total sur CA en fin de mois
     if cpt_id == 'ca':
-        mc_total_mois  = mc_depenses_reelles(m, y)    # TX MC affectées au mois
-        mc_rec_restant = mc_rec_non_appliquees(m, y)  # récurrentes MC pas encore saisies
-        mc_a_prelever  = mc_total_mois + mc_rec_restant
-        if mc_a_prelever > 0:
-            daily_events[last_day].append(("Prélèvement MC", -mc_a_prelever))
+        mc_total  = mc_depenses_reelles(m, y)
+        mc_rec_r  = mc_rec_non_appliquees(m, y)
+        mc_prelev = mc_total + mc_rec_r
+        if mc_prelev > 0:
+            daily_events[last_day].append(('Prélèvement MC', -mc_prelev, True))
 
-    # ── Courbe jour par jour ───────────────────────────────────────────────
-    sol = solde_act
+    # ── Rejouer jour par jour depuis le solde début ────────────────────────
+    sol = sol_debut
     jours = []
-    point_bas_sol = solde_act
-    point_bas_jour = now.day
+    point_bas_sol = sol_debut
+    point_bas_jour = 1
 
-    for day in range(now.day + 1, last_day + 1):
+    for day in range(1, last_day + 1):
         evts = daily_events.get(day, [])
-        for nom, delta in evts:
+        for nom, delta, _ in evts:
             sol += delta
         date_str = f"{day:02d}/{m+1:02d}"
-        jours.append((date_str, round(sol, 2), list(evts)))
+        # Événements visibles dans la liste = futurs uniquement (utiles pour l'utilisateur)
+        evts_affich = [(n, d) for n, d, fut in evts if fut]
+        jours.append((date_str, round(sol, 2), evts_affich))
         if sol < point_bas_sol:
             point_bas_sol = sol
             point_bas_jour = day
 
-    sol_fin = jours[-1][1] if jours else solde_act
+    sol_fin = jours[-1][1] if jours else sol_debut
     marge   = sol_fin - limite
     manque  = max(0.0, -(min(point_bas_sol, sol_fin) - limite))
 
@@ -737,9 +736,9 @@ def projection_fin_mois(cpt_id):
         'od':           od,
         'marge':        round(marge, 2),
         'limite':       limite,
+        'sol_debut':    sol_debut,
     }
 
-# ── CSS ─────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 .main > div { padding-top: 1rem; }
@@ -856,14 +855,21 @@ with tabs[0]:
             g_int = int(color[3:5], 16)
             b_int = int(color[5:7], 16)
 
-            # Point de départ = aujourd'hui
-            x_vals = [f"{now.day:02d}/{m_now+1:02d}"] + [j[0] for j in proj['jours']]
-            y_vals = [proj['solde_actuel']] + [j[1] for j in proj['jours']]
+            # Courbe complète : passé (01 → aujourd'hui) + futur (aujourd'hui → fin mois)
+            x_vals = [j[0] for j in proj['jours']]
+            y_vals = [j[1] for j in proj['jours']]
+            today_str = f"{now.day:02d}/{m_now+1:02d}"
 
-            # Identifier les jours avec événements
+            # Séparer passé et futur pour colorer différemment
+            x_past = [j[0] for j in proj['jours'] if int(j[0][:2]) <= now.day]
+            y_past = [j[1] for j in proj['jours'] if int(j[0][:2]) <= now.day]
+            x_futur = [j[0] for j in proj['jours'] if int(j[0][:2]) >= now.day]
+            y_futur = [j[1] for j in proj['jours'] if int(j[0][:2]) >= now.day]
+
+            # Identifier les jours futurs avec événements
             evt_x, evt_y, evt_txt = [], [], []
             for date_s, sol_j, evts in proj['jours']:
-                if evts:
+                if evts and int(date_s[:2]) > now.day:
                     evt_x.append(date_s)
                     evt_y.append(sol_j)
                     lines_evt = "<br>".join(
@@ -875,21 +881,35 @@ with tabs[0]:
             fig_c = go.Figure()
 
             # Zone sous 0
+            all_y = [v for v in y_vals if v is not None]
             fig_c.add_hrect(
-                y0=min(min(y_vals)*1.15, limite*1.3), y1=0,
+                y0=min(min(all_y)*1.15 if all_y else -500, limite*1.3), y1=0,
                 fillcolor="rgba(220,50,50,0.05)", line_width=0
             )
 
-            # Courbe principale
-            fig_c.add_trace(go.Scatter(
-                x=x_vals, y=y_vals,
-                mode='lines',
-                name=cpt_info['label'],
-                line=dict(color=color, width=2.5),
-                fill='tozeroy',
-                fillcolor=f"rgba({r_int},{g_int},{b_int},0.08)",
-                hovertemplate='%{x}<br>Solde : %{y:,.2f} €<extra></extra>'
-            ))
+            # Courbe passé (pleine)
+            if x_past:
+                fig_c.add_trace(go.Scatter(
+                    x=x_past, y=y_past,
+                    mode='lines',
+                    name=f"{cpt_info['label']} (réel)",
+                    line=dict(color=color, width=2.5),
+                    fill='tozeroy',
+                    fillcolor=f"rgba({r_int},{g_int},{b_int},0.10)",
+                    hovertemplate='%{x}<br>Solde réel : %{y:,.2f} €<extra></extra>'
+                ))
+
+            # Courbe futur (pointillé)
+            if x_futur:
+                fig_c.add_trace(go.Scatter(
+                    x=x_futur, y=y_futur,
+                    mode='lines',
+                    name=f"{cpt_info['label']} (estimé)",
+                    line=dict(color=color, width=2, dash='dot'),
+                    fill='tozeroy',
+                    fillcolor=f"rgba({r_int},{g_int},{b_int},0.04)",
+                    hovertemplate='%{x}<br>Solde estimé : %{y:,.2f} €<extra></extra>'
+                ))
 
             # Marqueurs événements
             if evt_x:
@@ -915,6 +935,16 @@ with tabs[0]:
                     textposition='bottom center',
                     hovertemplate=f'Point le plus bas<br>{fmt2(pb_sol)}<extra></extra>'
                 ))
+
+            # Ligne verticale aujourd'hui
+            if today_str in x_vals:
+                fig_c.add_shape(type='line', x0=today_str, x1=today_str, y0=0, y1=1,
+                                xref='x', yref='paper',
+                                line=dict(dash='dot', color='gray', width=1.5))
+                fig_c.add_annotation(x=today_str, y=1, yref='paper',
+                                     text="Aujourd'hui", showarrow=False,
+                                     xanchor='left', yanchor='top',
+                                     font=dict(size=11, color='gray'))
 
             # Ligne 0
             fig_c.add_hline(y=0, line_dash="solid", line_color="rgba(0,0,0,0.2)", line_width=1)

@@ -156,16 +156,17 @@ BUDGET_CIBLE_DEFAULT = {
 }
 # Revenu cible mensuel par compte (0 = utiliser historique réel)
 REVENU_CIBLE_DEFAULT = {'ca': 0, 'mb': 0}
-# Charger depuis D si existe, sinon default
-if 'budget_cible' not in D:
-    D['budget_cible'] = BUDGET_CIBLE_DEFAULT
-if 'revenu_cible' not in D:
-    D['revenu_cible'] = REVENU_CIBLE_DEFAULT
 
 D = st.session_state.data
 
 if D['cats'] and isinstance(D['cats'][0], str):
     D['cats'] = [{'nom': c, 'visible': True} for c in D['cats']]
+
+# Migrations : ajouter les nouvelles clés si absentes
+if 'budget_cible' not in D:
+    D['budget_cible'] = BUDGET_CIBLE_DEFAULT
+if 'revenu_cible' not in D:
+    D['revenu_cible'] = dict(REVENU_CIBLE_DEFAULT)
 
 def persist():
     save_to_gsheet(st.session_state.data)

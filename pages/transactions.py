@@ -52,8 +52,19 @@ def render(D, persist, cur_m=None, cur_y=None):
             return False
         return True
 
+    def sort_key(t):
+        # Pour MC : trier par date réelle dans le mois d'affectation
+        # Pour CA/MB : trier par date réelle
+        if t.get("compte") == "mc":
+            # Date synthétique : année/mois affectation + jour réel
+            aff_m = int(t.get("affM", 0))
+            aff_y = int(t.get("affY", 2026))
+            real_day = t["date"][8:10]  # JJ
+            return f"{aff_y}{aff_m:02d}{real_day}"
+        return t["date"]
+
     tx_show = sorted([t for t in D["tx"] if match(t)],
-                     key=lambda t: t["date"], reverse=True)
+                     key=sort_key, reverse=True)
 
     # ── Statistiques rapides ──────────────────────────────────────────────
     tx_all_month = [t for t in D["tx"] if aff_key(t) == (filt_y, filt_m)

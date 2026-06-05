@@ -237,20 +237,23 @@ def _render_saisie(D, persist, default_cpt, default_m, default_y):
             auto_m, auto_y = mc_aff_from_date(tx_date.strftime("%Y-%m-%d"))
             st.caption(f"💳 Affectation calculée : **{MOIS[auto_m]} {auto_y}**  *(modifiable ci-dessous si nécessaire)*")
             ov1, ov2 = st.columns(2)
+            # Clé dépend de la date → Streamlit réinitialise le selectbox si la date change
+            date_key = tx_date.strftime("%Y%m%d")
             override_aff_m = ov1.selectbox("Mois affectation", range(12),
                                             index=auto_m, format_func=lambda x: MOIS[x],
-                                            key="saisie_aff_m")
+                                            key=f"saisie_aff_m_{date_key}")
             override_aff_y = ov2.selectbox("Année", list(range(2024, 2029)),
                                             index=list(range(2024, 2029)).index(auto_y) if auto_y in range(2024, 2029) else 0,
-                                            key="saisie_aff_y")
+                                            key=f"saisie_aff_y_{date_key}")
 
         if st.form_submit_button("✅ Ajouter", type="primary", use_container_width=True):
             date_str = tx_date.strftime("%Y-%m-%d")
             st.session_state.saisie_last_date = tx_date  # mémoriser la date
             aff_m, aff_y = (None, None)
             if tx_cpt == "mc":
-                aff_m = override_aff_m
-                aff_y = override_aff_y
+                date_key_s = tx_date.strftime("%Y%m%d")
+                aff_m = st.session_state.get(f"saisie_aff_m_{date_key_s}", auto_m if 'auto_m' in dir() else override_aff_m)
+                aff_y = st.session_state.get(f"saisie_aff_y_{date_key_s}", auto_y if 'auto_y' in dir() else override_aff_y)
 
             new_tx = {
                 "id": f"tx_{int(datetime.now().timestamp()*1000)}",

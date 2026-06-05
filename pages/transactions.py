@@ -39,7 +39,7 @@ def render(D, persist, cur_m=None, cur_y=None):
                               format_func=lambda x: MOIS[x], key="tx_filt_m")
     with f4:
         show_exc = st.checkbox("⭐ Excep.", value=False, key="tx_show_exc",
-                               help="Afficher aussi les exceptionnelles")
+                               help="Afficher uniquement les exceptionnelles")
 
     # Filtrage
     def match(t):
@@ -48,19 +48,16 @@ def render(D, persist, cur_m=None, cur_y=None):
         ak = aff_key(t)
         if ak != (filt_y, filt_m):
             return False
-        if not show_exc and t.get("exceptionnel", False):
-            return False
         return True
 
     # Filtre par mois d'affectation (aff_key)
     # Tri par date réelle décroissante.
     # Pour MC : les TX du 25/12 au 31/12 sont les premières du mois
     # d'affectation suivant → elles apparaissent en bas (les plus anciennes).
-    tx_show = sorted(
-        [t for t in D["tx"] if match(t)],
-        key=lambda t: t["date"],
-        reverse=True
-    )
+    tx_filtered = [t for t in D["tx"] if match(t)]
+    if show_exc:
+        tx_filtered = [t for t in tx_filtered if t.get("exceptionnel", False)]
+    tx_show = sorted(tx_filtered, key=lambda t: t["date"], reverse=True)
 
     # ── Statistiques rapides ──────────────────────────────────────────────
     tx_all_month = [t for t in D["tx"] if aff_key(t) == (filt_y, filt_m)

@@ -13,6 +13,7 @@ from pages.aujourdhui import render as render_aujourdhui
 from pages.transactions import render as render_transactions
 from pages.parametres import render as render_parametres
 from pages.sauvegarde import render as render_sauvegarde
+from pages.previsionnel import render as render_previsionnel
 
 st.set_page_config(
     page_title="Budget Familial",
@@ -112,10 +113,7 @@ with tabs[1]:
     render_transactions(D, persist, cur_m=M, cur_y=Y)
 
 with tabs[2]:
-    st.subheader("📈 Prévisionnel")
-    st.info("🚧 En cours de développement — disponible dans l'étape 2.")
-    st.caption("Le prévisionnel sera basé sur une source unique de données (les TX réelles) "
-               "avec le budget cible comme complément. Cohérent avec les barres et la courbe.")
+    render_previsionnel(D)
 
 with tabs[3]:
     render_parametres(D, persist, M, Y)

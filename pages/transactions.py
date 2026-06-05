@@ -14,10 +14,13 @@ MOIS = ['Janvier','Février','Mars','Avril','Mai','Juin',
 MOIS_COURT = ['Jan','Fév','Mar','Avr','Mai','Jun','Jul','Aoû','Sep','Oct','Nov','Déc']
 
 
-def render(D, persist):
+def render(D, persist, cur_m=None, cur_y=None):
     st.subheader("📋 Transactions")
 
     now = datetime.now()
+    # Utiliser la navigation globale si fournie
+    default_m = cur_m if cur_m is not None else now.month - 1
+    default_y = cur_y if cur_y is not None else now.year
 
     # ── Filtres ───────────────────────────────────────────────────────────
     f1, f2, f3, f4 = st.columns([2, 2, 2, 1])
@@ -27,12 +30,13 @@ def render(D, persist):
                                 format_func=lambda x: cpt_opts[x], key="tx_filt_cpt")
     with f2:
         annees = sorted({datetime.strptime(t["date"], "%Y-%m-%d").year
-                         for t in D["tx"]}, reverse=True) or [now.year]
-        filt_y = st.selectbox("Année", annees, key="tx_filt_y")
+                         for t in D["tx"]}, reverse=True) or [default_y]
+        filt_y = st.selectbox("Année", annees,
+                              index=annees.index(default_y) if default_y in annees else 0,
+                              key="tx_filt_y")
     with f3:
-        filt_m = st.selectbox("Mois", range(12), index=now.month - 1,
-                              format_func=lambda x: MOIS[x], key="tx_filt_m",
-                              label_visibility="collapsed" if False else "visible")
+        filt_m = st.selectbox("Mois", range(12), index=default_m,
+                              format_func=lambda x: MOIS[x], key="tx_filt_m")
     with f4:
         show_exc = st.checkbox("⭐ Excep.", value=False, key="tx_show_exc",
                                help="Afficher aussi les exceptionnelles")

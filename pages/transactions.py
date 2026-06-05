@@ -174,6 +174,9 @@ def render(D, persist):
 
                 if st.form_submit_button("💾 Enregistrer", use_container_width=True):
                     date_str = new_date.strftime("%Y-%m-%d")
+                    # Lire l'affectation MC depuis session_state (valeur du selectbox au moment du submit)
+                    final_aff_m = st.session_state.get(f"eaff_m_{t['id']}", aff_m_val)
+                    final_aff_y = st.session_state.get(f"eaff_y_{t['id']}", aff_y_val)
                     idx = next(i for i, x in enumerate(D["tx"]) if x["id"] == t["id"])
                     D["tx"][idx] = {
                         **t,
@@ -184,8 +187,8 @@ def render(D, persist):
                         "type": new_type,
                         "note": new_note,
                         "exceptionnel": new_exc,
-                        "affM": aff_m_val,
-                        "affY": aff_y_val,
+                        "affM": final_aff_m,
+                        "affY": final_aff_y,
                     }
                     persist()
                     st.success("✓")

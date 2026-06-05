@@ -89,11 +89,14 @@ def render(D, persist, cur_m=None, cur_y=None):
 
     # ── Détection des doublons ────────────────────────────────────────────
     with st.expander("🔍 Détecter les doublons", expanded=False):
-        # Chercher TX avec même compte + montant + note + date (± 1 jour)
+        st.caption(f"Analyse sur **{MOIS[filt_m]} {filt_y}** — {cpt_opts.get(filt_cpt, filt_cpt)}")
         from collections import defaultdict
         groupes = defaultdict(list)
         for t in D["tx"]:
-            # Clé : compte + montant + note (insensible casse) + date exacte
+            if filt_cpt != "all" and t["compte"] != filt_cpt:
+                continue
+            if aff_key(t) != (filt_y, filt_m):
+                continue
             key = (
                 t["compte"],
                 round(t["montant"], 2),
@@ -101,11 +104,9 @@ def render(D, persist, cur_m=None, cur_y=None):
                 t["date"]
             )
             groupes[key].append(t)
-
         doublons = {k: v for k, v in groupes.items() if len(v) > 1}
-
         if not doublons:
-            st.success("✅ Aucun doublon détecté sur vos 711 transactions.")
+            st.success(f"✅ Aucun doublon sur {MOIS[filt_m]} {filt_y}.")
         else:
             st.warning(f"⚠️ **{len(doublons)} groupe(s) de doublons détectés** — vérifiez et supprimez les entrées en trop.")
             for key, txs in doublons.items():
@@ -307,9 +308,8 @@ def _render_saisie(D, persist, default_cpt, default_m, default_y):
             st.session_state.saisie_last_date = tx_date  # mémoriser la date
             aff_m, aff_y = (None, None)
             if tx_cpt == "mc":
-                date_key_s = tx_date.strftime("%Y%m%d")
-                aff_m = st.session_state.get(f"saisie_aff_m_{date_key_s}", auto_m if 'auto_m' in dir() else override_aff_m)
-                aff_y = st.session_state.get(f"saisie_aff_y_{date_key_s}", auto_y if 'auto_y' in dir() else override_aff_y)
+                aff_m = st.session_state.get("saisie_sel_m", auto_m)
+                aff_y = st.session_state.get("saisie_sel_y", auto_y)
 
             new_tx = {
                 "id": f"tx_{int(datetime.now().timestamp()*1000)}",

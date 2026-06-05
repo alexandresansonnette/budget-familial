@@ -63,6 +63,8 @@ def render(D, persist):
     s3.metric("Sorties", fmt2(dep))
     s4.metric("Net", fmt2(rev - dep))
 
+    if filt_cpt == "mc":
+        st.caption("💳 Les transactions MC sont affichées selon leur **mois d'affectation** (pas leur date réelle).")
     st.divider()
 
     # ── Saisie rapide ─────────────────────────────────────────────────────
@@ -153,17 +155,25 @@ def render(D, persist):
                     new_note = st.text_input("Note", value=t.get("note", ""), key=f"en_{t['id']}")
                     new_exc = st.checkbox("⭐ Exceptionnelle", value=is_exc, key=f"eexc_{t['id']}")
 
-                # Affectation MC auto
+                # Affectation MC : modifiable manuellement
                 aff_m_val, aff_y_val = t.get("affM"), t.get("affY")
                 if new_cpt == "mc":
                     auto_m, auto_y = mc_aff_from_date(new_date.strftime("%Y-%m-%d"))
-                    st.info(f"💳 Affectation automatique : **{MOIS[auto_m]} {auto_y}**")
-                    aff_m_val, aff_y_val = auto_m, auto_y
+                    cur_aff_m = int(aff_m_val) if aff_m_val is not None else auto_m
+                    cur_aff_y = int(aff_y_val) if aff_y_val is not None else auto_y
+                    st.caption("💳 Mois d'affectation MC (modifiable si besoin) :")
+                    ma1, ma2 = st.columns(2)
+                    aff_m_val = ma1.selectbox("Mois affectation", range(12),
+                                              index=cur_aff_m,
+                                              format_func=lambda x: MOIS[x],
+                                              key=f"eaff_m_{t['id']}")
+                    aff_y_val = ma2.selectbox("Année affectation",
+                                              list(range(2024, 2029)),
+                                              index=list(range(2024, 2029)).index(cur_aff_y) if cur_aff_y in range(2024, 2029) else 0,
+                                              key=f"eaff_y_{t['id']}")
 
                 if st.form_submit_button("💾 Enregistrer", use_container_width=True):
                     date_str = new_date.strftime("%Y-%m-%d")
-                    if new_cpt == "mc":
-                        aff_m_val, aff_y_val = mc_aff_from_date(date_str)
                     idx = next(i for i, x in enumerate(D["tx"]) if x["id"] == t["id"])
                     D["tx"][idx] = {
                         **t,
@@ -187,6 +197,8 @@ def _render_saisie(D, persist, default_cpt, default_m, default_y):
     # Sélection compte hors formulaire (persiste entre saisies)
     if "saisie_cpt" not in st.session_state:
         st.session_state.saisie_cpt = default_cpt if default_cpt != "all" else "ca"
+    if "saisie_last_date" not in st.session_state:
+        st.session_state.saisie_last_date = date.today()
 
     cpt_keys = list(COMPTES.keys())
     tx_cpt = st.selectbox(
@@ -206,7 +218,7 @@ def _render_saisie(D, persist, default_cpt, default_m, default_y):
     with st.form("add_tx", clear_on_submit=True):
         c1, c2 = st.columns(2)
         with c1:
-            tx_date = st.date_input("Date", value=date.today(), format="DD/MM/YYYY")
+            tx_date = st.date_input("Date", value=st.session_state.saisie_last_date, format="DD/MM/YYYY")
             tx_type = st.radio("Type", ["depense", "revenu"],
                                format_func=lambda x: "💸 Dépense" if x == "depense" else "💰 Revenu",
                                horizontal=True)
@@ -216,15 +228,26 @@ def _render_saisie(D, persist, default_cpt, default_m, default_y):
             tx_note = st.text_input("Note", placeholder="Description…")
             tx_exc = st.checkbox("⭐ Exceptionnelle (exclue du prévisionnel)", value=False)
 
+        # Affectation MC : auto depuis date + override manuel possible
+        override_aff_m = override_aff_y = None
         if tx_cpt == "mc":
             auto_m, auto_y = mc_aff_from_date(tx_date.strftime("%Y-%m-%d"))
-            st.caption(f"Affectation MC calculée : **{MOIS[auto_m]} {auto_y}**")
+            st.caption(f"💳 Affectation calculée : **{MOIS[auto_m]} {auto_y}**  *(modifiable ci-dessous si nécessaire)*")
+            ov1, ov2 = st.columns(2)
+            override_aff_m = ov1.selectbox("Mois affectation", range(12),
+                                            index=auto_m, format_func=lambda x: MOIS[x],
+                                            key="saisie_aff_m")
+            override_aff_y = ov2.selectbox("Année", list(range(2024, 2029)),
+                                            index=list(range(2024, 2029)).index(auto_y) if auto_y in range(2024, 2029) else 0,
+                                            key="saisie_aff_y")
 
         if st.form_submit_button("✅ Ajouter", type="primary", use_container_width=True):
             date_str = tx_date.strftime("%Y-%m-%d")
+            st.session_state.saisie_last_date = tx_date  # mémoriser la date
             aff_m, aff_y = (None, None)
             if tx_cpt == "mc":
-                aff_m, aff_y = mc_aff_from_date(date_str)
+                aff_m = override_aff_m
+                aff_y = override_aff_y
 
             new_tx = {
                 "id": f"tx_{int(datetime.now().timestamp()*1000)}",

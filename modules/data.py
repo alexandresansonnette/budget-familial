@@ -136,9 +136,9 @@ def migrate(data):
     for t in data.get("tx", []):
         t.pop("recId", None)
 
-    # Recalculer affM/affY MC depuis la date si absent ou incohérent
+    # Calculer affM/affY MC uniquement si absent (ne pas écraser les affectations manuelles)
     for t in data.get("tx", []):
-        if t.get("compte") == "mc":
+        if t.get("compte") == "mc" and (t.get("affM") is None or t.get("affY") is None):
             t["affM"], t["affY"] = mc_aff_from_date(t["date"])
 
     # Clés manquantes

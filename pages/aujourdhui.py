@@ -289,14 +289,7 @@ def render(D):
                 unsafe_allow_html=True
             )
 
-    # Alertes
-    for cpt_id in ["ca", "mb"]:
-        for typ, msg in alertes(D, cpt_id):
-            cls = "alert-" + typ
-            st.markdown(
-                f'<div class="{cls}"><strong>{COMPTES[cpt_id]["label"]}</strong> — {msg}</div>',
-                unsafe_allow_html=True
-            )
+
 
     # Dernières TX
     st.markdown("---")

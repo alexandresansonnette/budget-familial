@@ -38,6 +38,13 @@ st.markdown("""
 if "data" not in st.session_state:
     st.session_state.data = load_from_gsheet()
 
+# Bouton rechargement forcé depuis Sheets
+with st.sidebar:
+    if st.button("🔄 Recharger les données"):
+        del st.session_state["data"]
+        st.cache_resource.clear()
+        st.rerun()
+
 D = st.session_state.data
 
 # Migrations au démarrage

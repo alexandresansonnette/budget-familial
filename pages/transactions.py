@@ -83,6 +83,54 @@ def render(D, persist, cur_m=None, cur_y=None):
 
     st.divider()
 
+    # ── Détection des doublons ────────────────────────────────────────────
+    with st.expander("🔍 Détecter les doublons", expanded=False):
+        # Chercher TX avec même compte + montant + note + date (± 1 jour)
+        from collections import defaultdict
+        groupes = defaultdict(list)
+        for t in D["tx"]:
+            # Clé : compte + montant + note (insensible casse) + date exacte
+            key = (
+                t["compte"],
+                round(t["montant"], 2),
+                t.get("note", "").strip().lower(),
+                t["date"]
+            )
+            groupes[key].append(t)
+
+        doublons = {k: v for k, v in groupes.items() if len(v) > 1}
+
+        if not doublons:
+            st.success("✅ Aucun doublon détecté sur vos 711 transactions.")
+        else:
+            st.warning(f"⚠️ **{len(doublons)} groupe(s) de doublons détectés** — vérifiez et supprimez les entrées en trop.")
+            for key, txs in doublons.items():
+                cpt, mnt, note, date_d = key
+                cpt_lbl = COMPTES.get(cpt, {"label": cpt})["label"]
+                st.markdown(
+                    f"**{date_d} — {cpt_lbl} — {fmt2(mnt)} — {note or '(sans note)'}**"
+                    f" → {len(txs)} occurrences"
+                )
+                for i, t in enumerate(txs):
+                    c1, c2, c3 = st.columns([3, 2, 1])
+                    aff = ""
+                    if t["compte"] == "mc":
+                        aff = f" → affecté {MOIS[int(t['affM'])]} {int(t['affY'])}"
+                    c1.caption(f"#{i+1} — {t['id']}{aff}")
+                    c2.caption(f"Catégorie : {t['categorie']}")
+                    if i > 0:  # Proposer suppression sur les doublons (pas le premier)
+                        if c3.button("🗑 Supprimer", key=f"dup_del_{t['id']}",
+                                     help="Garder le premier, supprimer celui-ci"):
+                            D["tx"] = [x for x in D["tx"] if x["id"] != t["id"]]
+                            persist()
+                            st.success(f"✓ Supprimé.")
+                            st.rerun()
+                    else:
+                        c3.caption("✓ garder")
+                st.divider()
+
+    st.divider()
+
     # ── Tableau principal ─────────────────────────────────────────────────
     if not tx_show:
         st.info("Aucune transaction pour ce filtre.")

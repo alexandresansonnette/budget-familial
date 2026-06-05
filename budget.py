@@ -102,7 +102,7 @@ with tabs[0]:
     render_aujourdhui(D)
 
 with tabs[1]:
-    render_transactions(D, persist)
+    render_transactions(D, persist, cur_m=M, cur_y=Y)
 
 with tabs[2]:
     st.subheader("📈 Prévisionnel")

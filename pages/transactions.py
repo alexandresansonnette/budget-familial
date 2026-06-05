@@ -52,7 +52,10 @@ def render(D, persist, cur_m=None, cur_y=None):
             return False
         return True
 
-    # Filtre par mois d'affectation (aff_key), tri par date réelle
+    # Filtre par mois d'affectation (aff_key)
+    # Tri par date réelle décroissante.
+    # Pour MC : les TX du 25/12 au 31/12 sont les premières du mois
+    # d'affectation suivant → elles apparaissent en bas (les plus anciennes).
     tx_show = sorted(
         [t for t in D["tx"] if match(t)],
         key=lambda t: t["date"],

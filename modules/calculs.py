@@ -129,7 +129,7 @@ def _mvt_net(D, cpt_id, m, y):
 
 
 def solde_a_date(D, cpt_id):
-    """Solde réel du compte à l'instant présent."""
+    """Solde réel du compte à l'instant présent (MC déduite pour CA)."""
     now = datetime.now()
     m, y = now.month - 1, now.year
     deb = get_sol(D["sol"], cpt_id, m, y)
@@ -145,6 +145,25 @@ def solde_a_date(D, cpt_id):
     if cpt_id == "ca":
         sol -= mc_depenses_mois(D["tx"], m, y, jusqu_au=now)
     return sol
+
+
+def solde_bancaire(D, cpt_id):
+    """
+    Solde tel qu'affiché sur le relevé bancaire.
+    Pour CA : sans déduire l'encours MC (la MC n'est pas encore prélevée).
+    C'est ce que tu vois sur ton application CA en ligne.
+    """
+    now = datetime.now()
+    m, y = now.month - 1, now.year
+    deb = get_sol(D["sol"], cpt_id, m, y)
+    if deb is None:
+        return None
+    txs = [t for t in D["tx"]
+           if t["compte"] == cpt_id
+           and aff_key(t) == (y, m)
+           and datetime.strptime(t["date"], "%Y-%m-%d") <= now]
+    return deb + sum(t["montant"] if t["type"] == "revenu" else -t["montant"]
+                     for t in txs)
 
 
 # ── Transactions filtrées ────────────────────────────────────────────────────

@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 import pandas as pd
 from modules.data import COMPTES
 from modules.prevision import build_monthly_data, agreger_foyer, mois_label
+from modules.calculs import solde_bancaire, mc_depenses_mois
 from modules.fmt import fmt, fmt2
 from datetime import datetime
 
@@ -195,6 +196,45 @@ def render(D, persist=None):
         st.warning("⚠️ Solde CA non renseigné — allez dans Paramètres > Soldes.")
     if sol_mb is None:
         st.warning("⚠️ Solde Monabanq non renseigné — allez dans Paramètres > Soldes.")
+
+    # ══ BANDEAU SOLDES ACTUELS ════════════════════════════════════════════
+    now_pv = datetime.now()
+    m_now, y_now = now_pv.month - 1, now_pv.year
+    b1, b2 = st.columns(2)
+    for col, cpt_id in [(b1, 'ca'), (b2, 'mb')]:
+        with col:
+            cpt = COMPTES[cpt_id]
+            sol_b = solde_bancaire(D, cpt_id)
+            od = D['overdraft'].get(cpt_id, 0)
+            s = "danger" if sol_b is not None and sol_b < -od else (
+                "warn" if sol_b is not None and sol_b < (-od + 300) else "ok")
+            border = {"ok": "#1D9E75", "warn": "#D97706", "danger": "#E24B4A"}[s]
+            sol_color = "#E24B4A" if (sol_b or 0) < 0 else "#1D9E75"
+            deb = D['sol'].get(f"{cpt_id}_{y_now}_{m_now}")
+
+            # Encours MC pour CA
+            mc_html = ""
+            if cpt_id == 'ca':
+                mc_enc = mc_depenses_mois(D['tx'], m_now, y_now, jusqu_au=now_pv)
+                mc_html = (f"<div style='margin-top:6px;font-size:12px;color:#888'>"
+                           f"Encours MC à ce jour : "
+                           f"<span style='color:{COMPTES["mc"]["color"]};font-weight:600'>"
+                           f"−{fmt2(mc_enc)}</span></div>")
+
+            st.markdown(
+                f'<div style="border:1.5px solid {border};border-radius:10px;'
+                f'padding:14px 16px;margin-bottom:12px;">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                f'<strong style="color:{cpt["color"]}">{cpt["label"]}</strong>'
+                f'<small style="color:#888">début : {fmt2(float(deb)) if deb else "—"}</small></div>'
+                f'<div style="font-size:22px;font-weight:700;color:{sol_color};margin:4px 0">'
+                f'{fmt2(sol_b) if sol_b is not None else "Solde non renseigné"}</div>'
+                f'<small style="color:#888">Découvert autorisé : {fmt2(-od)}</small>'
+                f'{mc_html}</div>',
+                unsafe_allow_html=True
+            )
+
+    st.divider()
 
     # ══ GRAPHIQUE FOYER ═══════════════════════════════════════════════════
     st.markdown("### Prévisionnel global du foyer")

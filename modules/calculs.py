@@ -182,12 +182,10 @@ def tx_mc_period(D, m, y):
     """
     cal_m = m + 1  # mois 1-indexed
     cal_y = y
-    # Début période : 25 du mois précédent
     if cal_m == 1:
         start = date(cal_y - 1, 12, 25)
     else:
         start = date(cal_y, cal_m - 1, 25)
-    # Fin période : 24 du mois courant
     end = date(cal_y, cal_m, 24)
     return [t for t in D["tx"]
             if t["compte"] == "mc"
@@ -212,7 +210,6 @@ def rec_futures(D, cpt_id):
     """Récurrentes du compte qui n'ont pas encore de TX réelle ce mois."""
     now = datetime.now()
     m, y = now.month - 1, now.year
-    # TX du mois par nom (pour détecter si déjà saisie manuellement)
     tx_noms = {t.get("note", "").strip().lower()
                for t in D["tx"] if aff_key(t) == (y, m) and t["compte"] == cpt_id}
     result = []
@@ -220,11 +217,25 @@ def rec_futures(D, cpt_id):
         if r["compte"] != cpt_id:
             continue
         if r["jour"] <= now.day:
-            continue  # déjà passé
+            continue
         if r["nom"].strip().lower() in tx_noms:
-            continue  # déjà saisie
+            continue
         result.append(r)
     return sorted(result, key=lambda r: r["jour"])
+
+
+# ── Matching récurrentes robuste ─────────────────────────────────────────────
+def _rec_deja_couverte(r, tx_mois):
+    """
+    True si une TX réelle couvre déjà cette récurrente.
+    Matching par type + montant à ±2% (pas par nom — trop fragile).
+    """
+    for t in tx_mois:
+        if t["type"] != r["type"]:
+            continue
+        if abs(t["montant"] - r["mnt"]) / max(r["mnt"], 0.01) <= 0.02:
+            return True
+    return False
 
 
 # ── Projection fin de mois ───────────────────────────────────────────────────
@@ -232,7 +243,17 @@ def projection_fin_mois(D, cpt_id):
     """
     Projette le solde jour par jour depuis le début du mois jusqu'à la fin.
     Source unique : sol_debut + TX réelles + récurrentes manquantes + MC.
+
+    Nouveautés :
+    - Matching récurrentes par montant+type (robuste, pas par nom)
+    - Support evt_one_shot (session_state) : événements ponctuels ajoutés manuellement
+    - Support evt_coches (session_state) : événements cochés comme déjà traités
+
+    Format retourné pour proj["jours"] :
+      [(date_str, solde, [(nom, delta, cle, is_coche), ...]), ...]
     """
+    import streamlit as st
+
     now = datetime.now()
     m, y = now.month - 1, now.year
     last_day = calendar.monthrange(y, m + 1)[1]
@@ -243,12 +264,17 @@ def projection_fin_mois(D, cpt_id):
     if sol_debut is None:
         return {"solde_actuel": None, "jours": [], "solde_fin": None,
                 "point_bas": (None, None), "statut": "ok",
-                "od": od, "marge": None, "limite": limite}
+                "od": od, "marge": None, "limite": limite, "manque": 0}
 
     solde_act = solde_a_date(D, cpt_id)
 
+    # Événements cochés et one-shot depuis session_state
+    coches = st.session_state.get("evt_coches", {}).get(cpt_id, set())
+    one_shots = st.session_state.get("evt_one_shot", {}).get(cpt_id, [])
+
     # Construire deltas jour par jour
-    daily = defaultdict(list)  # jour → [(nom, delta, is_future)]
+    # Structure : jour → [(nom, delta, is_future, cle)]
+    daily = defaultdict(list)
 
     # 1. TX réelles du mois
     for t in D["tx"]:
@@ -259,36 +285,49 @@ def projection_fin_mois(D, cpt_id):
         d_obj = datetime.strptime(t["date"], "%Y-%m-%d")
         delta = t["montant"] if t["type"] == "revenu" else -t["montant"]
         nom = t.get("note") or t["categorie"]
-        daily[d_obj.day].append((nom, delta, d_obj.date() > now.date()))
+        is_future = d_obj.date() > now.date()
+        cle = f"tx_{t.get('id', nom)}_{d_obj.day}"
+        daily[d_obj.day].append((nom, delta, is_future, cle))
 
-    # 2. Récurrentes non encore saisies ce mois
-    tx_noms_mois = {t.get("note", "").strip().lower()
-                    for t in D["tx"] if aff_key(t) == (y, m) and t["compte"] == cpt_id}
+    # 2. Récurrentes non encore couvertes ce mois
+    # Matching robuste : même type + montant ±2% (indépendant du nom)
+    tx_mois = [t for t in D["tx"] if aff_key(t) == (y, m) and t["compte"] == cpt_id]
     for r in D["rec"]:
         if r["compte"] != cpt_id:
             continue
-        if r["nom"].strip().lower() in tx_noms_mois:
-            continue
+        if _rec_deja_couverte(r, tx_mois):
+            continue  # déjà couverte par une TX réelle
         delta = r["mnt"] if r["type"] == "revenu" else -r["mnt"]
-        daily[r["jour"]].append((r["nom"], delta, True))
+        cle = f"rec_{r['nom']}_{r['jour']}"
+        daily[r["jour"]].append((r["nom"], delta, True, cle))
 
     # 3. Prélèvement MC total sur CA en fin de mois
     if cpt_id == "ca":
         mc_tot = mc_depenses_mois(D["tx"], m, y)
-        mc_rec = mc_rec_total(D["rec"])
-        # Récurrentes MC non encore saisies
-        mc_rec_noms = {r["nom"].strip().lower() for r in D["rec"]
-                       if r["compte"] == "mc" and r["type"] == "depense"}
-        tx_mc_noms = {t.get("note", "").strip().lower()
-                      for t in D["tx"] if t["compte"] == "mc" and aff_key(t) == (y, m)}
-        mc_rec_manquant = sum(r["mnt"] for r in D["rec"]
-                              if r["compte"] == "mc" and r["type"] == "depense"
-                              and r["nom"].strip().lower() not in tx_mc_noms)
+        mc_rec_manquant = 0
+        for r in D["rec"]:
+            if r["compte"] != "mc" or r["type"] != "depense":
+                continue
+            # Même matching robuste pour les récurrentes MC
+            deja = any(
+                t["type"] == "depense"
+                and abs(t["montant"] - r["mnt"]) / max(r["mnt"], 0.01) <= 0.02
+                for t in D["tx"] if t["compte"] == "mc" and aff_key(t) == (y, m)
+            )
+            if not deja:
+                mc_rec_manquant += r["mnt"]
         mc_a_prelever = mc_tot + mc_rec_manquant
         if mc_a_prelever > 0:
-            daily[last_day].append(("Prélèvement MC", -mc_a_prelever, True))
+            cle = f"mc_prelevement_{last_day}"
+            daily[last_day].append(("Prélèvement MC", -mc_a_prelever, True, cle))
 
-    # Rejouer depuis sol_debut
+    # 4. Événements one-shot ajoutés manuellement (session_state)
+    for evt in one_shots:
+        delta = evt["montant"] if evt["type"] == "revenu" else -evt["montant"]
+        cle = f"oneshot_{evt['jour']}_{evt['nom']}"
+        daily[evt["jour"]].append((evt["nom"], delta, True, cle))
+
+    # Rejouer depuis sol_debut jour par jour
     sol = sol_debut
     jours = []
     point_bas_sol = sol_debut
@@ -296,10 +335,16 @@ def projection_fin_mois(D, cpt_id):
 
     for day in range(1, last_day + 1):
         evts = daily.get(day, [])
-        for _, delta, _ in evts:
-            sol += delta
+        for nom, delta, is_future, cle in evts:
+            if cle not in coches:  # les cochés sont exclus du calcul
+                sol += delta
         date_str = f"{day:02d}/{m+1:02d}"
-        evts_affich = [(n, d) for n, d, fut in evts if fut]
+        # Événements futurs affichables (avec flag is_coche pour l'UI)
+        evts_affich = [
+            (nom, delta, cle, (cle in coches))
+            for nom, delta, is_future, cle in evts
+            if is_future
+        ]
         jours.append((date_str, round(sol, 2), evts_affich))
         if sol < point_bas_sol:
             point_bas_sol = sol

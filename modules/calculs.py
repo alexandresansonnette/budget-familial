@@ -70,7 +70,6 @@ def resolve_sol(D, cpt_id, target_m, target_y):
     Retourne (solde_debut_mois, source) en cherchant le solde saisi
     le plus proche et en propageant via les TX réelles.
     """
-    # Direct ?
     v = get_sol(D["sol"], cpt_id, target_m, target_y)
     if v is not None:
         return v, "saisi"
@@ -141,7 +140,6 @@ def solde_a_date(D, cpt_id):
            and datetime.strptime(t["date"], "%Y-%m-%d") <= now]
     sol = deb + sum(t["montant"] if t["type"] == "revenu" else -t["montant"]
                     for t in txs)
-    # MC déjà passée sur CA
     if cpt_id == "ca":
         sol -= mc_depenses_mois(D["tx"], m, y, jusqu_au=now)
     return sol
@@ -151,7 +149,6 @@ def solde_bancaire(D, cpt_id):
     """
     Solde tel qu'affiché sur le relevé bancaire.
     Pour CA : sans déduire l'encours MC (la MC n'est pas encore prélevée).
-    C'est ce que tu vois sur ton application CA en ligne.
     """
     now = datetime.now()
     m, y = now.month - 1, now.year
@@ -168,7 +165,6 @@ def solde_bancaire(D, cpt_id):
 
 # ── Transactions filtrées ────────────────────────────────────────────────────
 def tx_of_month(D, m, y, cpt_filter=None):
-    """TX affectées au mois (m, y), filtrées par compte si précisé."""
     txs = [t for t in D["tx"] if aff_key(t) == (y, m)]
     if cpt_filter:
         txs = [t for t in txs if t["compte"] == cpt_filter]
@@ -176,11 +172,7 @@ def tx_of_month(D, m, y, cpt_filter=None):
 
 
 def tx_mc_period(D, m, y):
-    """
-    TX MC correspondant à la période de facturation du mois (m, y) 0-indexed.
-    Période : du 25/(m-1) au 24/m.
-    """
-    cal_m = m + 1  # mois 1-indexed
+    cal_m = m + 1
     cal_y = y
     if cal_m == 1:
         start = date(cal_y - 1, 12, 25)
@@ -192,7 +184,7 @@ def tx_mc_period(D, m, y):
             and start <= datetime.strptime(t["date"], "%Y-%m-%d").date() <= end]
 
 
-# ── Alertes et récurrentes futures ───────────────────────────────────────────
+# ── Alertes ───────────────────────────────────────────────────────────────────
 def alertes(D, cpt_id):
     od = D["overdraft"].get(cpt_id, 0)
     solde = solde_a_date(D, cpt_id)
@@ -200,14 +192,13 @@ def alertes(D, cpt_id):
         return []
     alts = []
     if solde < -od:
-        alts.append(("danger", f"Solde dans le rouge"))
+        alts.append(("danger", "Solde dans le rouge"))
     elif solde < (-od + 300):
-        alts.append(("warn", f"Solde proche de la limite"))
+        alts.append(("warn", "Solde proche de la limite"))
     return alts
 
 
 def rec_futures(D, cpt_id):
-    """Récurrentes du compte qui n'ont pas encore de TX réelle ce mois."""
     now = datetime.now()
     m, y = now.month - 1, now.year
     tx_noms = {t.get("note", "").strip().lower()
@@ -224,11 +215,11 @@ def rec_futures(D, cpt_id):
     return sorted(result, key=lambda r: r["jour"])
 
 
-# ── Matching récurrentes robuste ─────────────────────────────────────────────
+# ── Matching récurrentes robuste ──────────────────────────────────────────────
 def _rec_deja_couverte(r, tx_mois):
     """
     True si une TX réelle couvre déjà cette récurrente.
-    Matching par type + montant à ±2% (pas par nom — trop fragile).
+    Matching par type + montant à ±2% — indépendant du nom.
     """
     for t in tx_mois:
         if t["type"] != r["type"]:
@@ -238,19 +229,17 @@ def _rec_deja_couverte(r, tx_mois):
     return False
 
 
-# ── Projection fin de mois ───────────────────────────────────────────────────
+# ── Projection fin de mois ────────────────────────────────────────────────────
 def projection_fin_mois(D, cpt_id):
     """
-    Projette le solde jour par jour depuis le début du mois jusqu'à la fin.
-    Source unique : sol_debut + TX réelles + récurrentes manquantes + MC.
+    Projette le solde jour par jour sur le mois courant.
 
-    Nouveautés :
-    - Matching récurrentes par montant+type (robuste, pas par nom)
-    - Support evt_one_shot (session_state) : événements ponctuels ajoutés manuellement
-    - Support evt_coches (session_state) : événements cochés comme déjà traités
+    Principe d'ancrage :
+    - Jours passés (< aujourd'hui) : recalculés depuis sol_debut + TX réelles
+    - Jour courant : ANCRÉ sur solde_bancaire() — colle exactement au relevé
+    - Jours futurs : projetés depuis l'ancrage via récurrentes manquantes + MC
 
-    Format retourné pour proj["jours"] :
-      [(date_str, solde, [(nom, delta, cle, is_coche), ...]), ...]
+    Format proj["jours"] : [(date_str, solde, [(nom, delta, cle, is_coche)])]
     """
     import streamlit as st
 
@@ -266,49 +255,55 @@ def projection_fin_mois(D, cpt_id):
                 "point_bas": (None, None), "statut": "ok",
                 "od": od, "marge": None, "limite": limite, "manque": 0}
 
+    # Ancrage : solde bancaire réel à aujourd'hui
+    sol_ancre = solde_bancaire(D, cpt_id)
+    if sol_ancre is None:
+        sol_ancre = sol_debut
+
     solde_act = solde_a_date(D, cpt_id)
 
     # Événements cochés et one-shot depuis session_state
     coches = st.session_state.get("evt_coches", {}).get(cpt_id, set())
     one_shots = st.session_state.get("evt_one_shot", {}).get(cpt_id, [])
 
-    # Construire deltas jour par jour
+    # ── Construire les deltas futurs (jours > aujourd'hui) ────────────────
     # Structure : jour → [(nom, delta, is_future, cle)]
-    daily = defaultdict(list)
+    daily_future = defaultdict(list)
 
-    # 1. TX réelles du mois
+    # TX réelles futures (saisies en avance)
     for t in D["tx"]:
         if t["compte"] != cpt_id:
             continue
         if aff_key(t) != (y, m):
             continue
         d_obj = datetime.strptime(t["date"], "%Y-%m-%d")
+        if d_obj.date() <= now.date():
+            continue  # déjà dans l'ancrage
         delta = t["montant"] if t["type"] == "revenu" else -t["montant"]
         nom = t.get("note") or t["categorie"]
-        is_future = d_obj.date() > now.date()
         cle = f"tx_{t.get('id', nom)}_{d_obj.day}"
-        daily[d_obj.day].append((nom, delta, is_future, cle))
+        daily_future[d_obj.day].append((nom, delta, True, cle))
 
-    # 2. Récurrentes non encore couvertes ce mois
-    # Matching robuste : même type + montant ±2% (indépendant du nom)
+    # Récurrentes non encore couvertes (matching robuste type+montant ±2%)
     tx_mois = [t for t in D["tx"] if aff_key(t) == (y, m) and t["compte"] == cpt_id]
     for r in D["rec"]:
         if r["compte"] != cpt_id:
             continue
+        if r["jour"] <= now.day:
+            continue  # jour passé, déjà dans l'ancrage
         if _rec_deja_couverte(r, tx_mois):
-            continue  # déjà couverte par une TX réelle
+            continue  # déjà une TX réelle qui couvre
         delta = r["mnt"] if r["type"] == "revenu" else -r["mnt"]
         cle = f"rec_{r['nom']}_{r['jour']}"
-        daily[r["jour"]].append((r["nom"], delta, True, cle))
+        daily_future[r["jour"]].append((r["nom"], delta, True, cle))
 
-    # 3. Prélèvement MC total sur CA en fin de mois
+    # Prélèvement MC total sur CA en fin de mois
     if cpt_id == "ca":
         mc_tot = mc_depenses_mois(D["tx"], m, y)
         mc_rec_manquant = 0
         for r in D["rec"]:
             if r["compte"] != "mc" or r["type"] != "depense":
                 continue
-            # Même matching robuste pour les récurrentes MC
             deja = any(
                 t["type"] == "depense"
                 and abs(t["montant"] - r["mnt"]) / max(r["mnt"], 0.01) <= 0.02
@@ -319,38 +314,72 @@ def projection_fin_mois(D, cpt_id):
         mc_a_prelever = mc_tot + mc_rec_manquant
         if mc_a_prelever > 0:
             cle = f"mc_prelevement_{last_day}"
-            daily[last_day].append(("Prélèvement MC", -mc_a_prelever, True, cle))
+            daily_future[last_day].append(("Prélèvement MC", -mc_a_prelever, True, cle))
 
-    # 4. Événements one-shot ajoutés manuellement (session_state)
+    # Événements one-shot ajoutés manuellement
     for evt in one_shots:
+        if evt["jour"] <= now.day:
+            continue  # passé, ignoré
         delta = evt["montant"] if evt["type"] == "revenu" else -evt["montant"]
         cle = f"oneshot_{evt['jour']}_{evt['nom']}"
-        daily[evt["jour"]].append((evt["nom"], delta, True, cle))
+        daily_future[evt["jour"]].append((evt["nom"], delta, True, cle))
 
-    # Rejouer depuis sol_debut jour par jour
-    sol = sol_debut
+    # ── Construire les deltas passés (jours 1..aujourd'hui) ───────────────
+    # Pour l'affichage du graphe passé uniquement — on repart de sol_debut
+    daily_past = defaultdict(list)
+    for t in D["tx"]:
+        if t["compte"] != cpt_id:
+            continue
+        if aff_key(t) != (y, m):
+            continue
+        d_obj = datetime.strptime(t["date"], "%Y-%m-%d")
+        if d_obj.date() > now.date():
+            continue
+        delta = t["montant"] if t["type"] == "revenu" else -t["montant"]
+        nom = t.get("note") or t["categorie"]
+        cle = f"tx_{t.get('id', nom)}_{d_obj.day}"
+        daily_past[d_obj.day].append((nom, delta, False, cle))
+
+    # ── Rejouer jour par jour ─────────────────────────────────────────────
     jours = []
-    point_bas_sol = sol_debut
-    point_bas_jour = 1
+    point_bas_sol = sol_ancre
+    point_bas_jour = now.day
 
-    for day in range(1, last_day + 1):
-        evts = daily.get(day, [])
-        for nom, delta, is_future, cle in evts:
-            if cle not in coches:  # les cochés sont exclus du calcul
-                sol += delta
+    # Passé : recalcul depuis sol_debut pour le graphe
+    sol_passé = sol_debut
+    for day in range(1, now.day):
+        evts = daily_past.get(day, [])
+        for nom, delta, _, cle in evts:
+            sol_passé += delta
         date_str = f"{day:02d}/{m+1:02d}"
-        # Événements futurs affichables (avec flag is_coche pour l'UI)
-        evts_affich = [
-            (nom, delta, cle, (cle in coches))
-            for nom, delta, is_future, cle in evts
-            if is_future
-        ]
+        jours.append((date_str, round(sol_passé, 2), []))
+        if sol_passé < point_bas_sol:
+            point_bas_sol = sol_passé
+            point_bas_jour = day
+
+    # Aujourd'hui : ancrage sur solde_bancaire réel
+    date_str_today = f"{now.day:02d}/{m+1:02d}"
+    jours.append((date_str_today, round(sol_ancre, 2), []))
+    if sol_ancre < point_bas_sol:
+        point_bas_sol = sol_ancre
+        point_bas_jour = now.day
+
+    # Futur : projection depuis l'ancrage
+    sol = sol_ancre
+    for day in range(now.day + 1, last_day + 1):
+        evts = daily_future.get(day, [])
+        evts_affich = []
+        for nom, delta, is_future, cle in evts:
+            if cle not in coches:
+                sol += delta
+            evts_affich.append((nom, delta, cle, (cle in coches)))
+        date_str = f"{day:02d}/{m+1:02d}"
         jours.append((date_str, round(sol, 2), evts_affich))
         if sol < point_bas_sol:
             point_bas_sol = sol
             point_bas_jour = day
 
-    sol_fin = jours[-1][1] if jours else sol_debut
+    sol_fin = jours[-1][1] if jours else sol_ancre
     marge = sol_fin - limite
     manque = max(0.0, -(min(point_bas_sol, sol_fin) - limite))
 

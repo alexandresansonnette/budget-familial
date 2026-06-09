@@ -3,7 +3,7 @@ Budget Familial AS — Module prévision
 Calculs prévisionnels basés sur une source unique : les TX réelles.
 
 Règles :
-- Passé : TX réelles groupées par mois d'affectation
+- Passé : TX réelles groupées par mois d'affectation, ancrées sur soldes saisis
 - Futur : récurrentes + budget cible (moyenne pondérée si historique suffisant)
 - MC : intégrée dans CA (débit différé)
 - Virements internes / Épargne : exclus des barres (neutres pour le foyer)
@@ -12,7 +12,7 @@ import numpy as np
 from datetime import datetime
 from collections import defaultdict
 from modules.data import CATS_NEUTRES, CATS_REVENUS
-from modules.calculs import aff_key, month_add, resolve_sol, mc_depenses_mois
+from modules.calculs import aff_key, month_add, resolve_sol, mc_depenses_mois, get_sol, solde_bancaire
 
 
 MOIS_COURT = ['Jan','Fév','Mar','Avr','Mai','Jun','Jul','Aoû','Sep','Oct','Nov','Déc']
@@ -25,15 +25,20 @@ def mois_label(m, y):
 def build_monthly_data(D, cpt_id, n_past=6, n_future=5):
     """
     Construit les données mensuelles pour un compte sur n_past + 1 + n_future mois.
-    
+
+    Passé : pour chaque mois, on réancre sur le solde saisi si disponible,
+            puis on applique les TX réelles pour obtenir sol_fin.
+    Futur : on part du solde bancaire ancré d'aujourd'hui, puis on estime
+            via récurrentes + historique.
+
     Retourne une liste de dicts :
     {
         'label': str,
         'm': int, 'y': int,
-        'entrees': float,      # revenus réels ou estimés (hors neutres)
-        'sorties': float,      # dépenses réelles ou estimées (hors neutres, MC incluse sur CA)
-        'sol_fin': float|None, # solde fin de mois
-        'is_fc': bool,         # True = prévisionnel
+        'entrees': float,
+        'sorties': float,
+        'sol_fin': float|None,
+        'is_fc': bool,
     }
     """
     now = datetime.now()
@@ -42,18 +47,18 @@ def build_monthly_data(D, cpt_id, n_past=6, n_future=5):
     months = [month_add(cm, cy, i) for i in range(-n_past, n_future + 1)]
     rows = []
 
-    # Solde de départ : début du mois le plus ancien
-    start_m, start_y = months[0]
-    sol_debut, _ = resolve_sol(D, cpt_id, start_m, start_y)
-    sol_courant = sol_debut or 0.0
-
     # Budget cible pour ce compte
     budget_cible = D.get('budget_cible', {}).get(cpt_id, {})
     revenu_cible = float(D.get('revenu_cible', {}).get(cpt_id, 0))
 
-    # Calcul de la moyenne historique pour les dépenses variables (6 mois passés)
+    # Historique pour estimation future
     hist_dep = _build_hist_dep(D, cpt_id, cm, cy, n_past)
     hist_rev = _build_hist_rev(D, cpt_id, cm, cy, n_past)
+
+    # Solde propagé — initialisé sur le premier mois
+    start_m, start_y = months[0]
+    sol_propage, _ = resolve_sol(D, cpt_id, start_m, start_y)
+    sol_propage = sol_propage or 0.0
 
     for idx, (m, y) in enumerate(months):
         rel = idx - n_past  # -6..0..+5
@@ -61,16 +66,31 @@ def build_monthly_data(D, cpt_id, n_past=6, n_future=5):
         label = mois_label(m, y)
 
         if not is_fc:
-            # ── PASSÉ + mois courant : TX réelles ────────────────────────
+            # ── PASSÉ + mois courant ──────────────────────────────────────
+            # Réancrage : si un solde de début est saisi pour ce mois, on l'utilise
+            sol_ancre = get_sol(D['sol'], cpt_id, m, y)
+            if sol_ancre is not None:
+                sol_debut = sol_ancre
+            else:
+                sol_debut = sol_propage  # propagé depuis le mois précédent
+
             entrees, sorties = _real_month(D, cpt_id, m, y)
-            sol_courant += entrees - sorties
-            sol_fin = round(sol_courant, 2)
+
+            # Pour le mois courant : ancrage sur solde_bancaire réel
+            if m == cm and y == cy:
+                sol_fin_reel = solde_bancaire(D, cpt_id)
+                sol_fin = sol_fin_reel if sol_fin_reel is not None else round(sol_debut + entrees - sorties, 2)
+            else:
+                sol_fin = round(sol_debut + entrees - sorties, 2)
+
+            sol_propage = sol_fin  # pour le mois suivant si pas d'ancrage
+
         else:
-            # ── FUTUR : estimation ────────────────────────────────────────
+            # ── FUTUR : estimation depuis sol_propage ─────────────────────
             entrees = _estimate_rev(D, cpt_id, hist_rev, revenu_cible)
             sorties = _estimate_dep(D, cpt_id, hist_dep, budget_cible, m)
-            sol_courant += entrees - sorties
-            sol_fin = round(sol_courant, 2)
+            sol_fin = round(sol_propage + entrees - sorties, 2)
+            sol_propage = sol_fin
 
         rows.append({
             'label': label, 'm': m, 'y': y,
@@ -80,7 +100,7 @@ def build_monthly_data(D, cpt_id, n_past=6, n_future=5):
             'is_fc': is_fc,
         })
 
-    return rows, sol_debut
+    return rows, get_sol(D['sol'], cpt_id, cm, cy)
 
 
 def _real_month(D, cpt_id, m, y):
@@ -105,7 +125,7 @@ def _real_month(D, cpt_id, m, y):
 
 
 def _build_hist_dep(D, cpt_id, cm, cy, n_past):
-    """Historique mensuel des dépenses variables (hors récurrentes, hors exceptionnels)."""
+    """Historique mensuel des dépenses réelles (hors neutres)."""
     hist = []
     for i in range(1, n_past + 1):
         pm, py = month_add(cm, cy, -i)
@@ -128,7 +148,7 @@ def _build_hist_dep(D, cpt_id, cm, cy, n_past):
 
 
 def _build_hist_rev(D, cpt_id, cm, cy, n_past):
-    """Historique mensuel des revenus variables (hors récurrentes, hors exceptionnels)."""
+    """Historique mensuel des revenus réels (hors neutres)."""
     hist = []
     for i in range(1, n_past + 1):
         pm, py = month_add(cm, cy, -i)
@@ -149,7 +169,6 @@ def _estimate_rev(D, cpt_id, hist_rev, revenu_cible):
                   if r['compte'] == cpt_id and r['type'] == 'revenu')
 
     if hist_rev:
-        # Filtre IQR
         hist_filt = _iqr_filter(hist_rev)
         if hist_filt:
             w = np.exp(-0.2 * np.arange(len(hist_filt) - 1, -1, -1))
@@ -159,7 +178,6 @@ def _estimate_rev(D, cpt_id, hist_rev, revenu_cible):
     else:
         avg_var = 0.0
 
-    # Fusion avec revenu cible
     if revenu_cible > 0:
         n = len(hist_rev)
         w_cible = max(0.0, (12 - n) / 12)
@@ -186,7 +204,6 @@ def _estimate_dep(D, cpt_id, hist_dep, budget_cible, target_m):
     else:
         avg_var = 0.0
 
-    # Fusion avec budget cible
     cible_total = sum(budget_cible.values())
     if cible_total > 0:
         n = len(hist_dep)
@@ -209,13 +226,12 @@ def _iqr_filter(vals):
 def agreger_foyer(rows_ca, rows_mb):
     """
     Agrège CA + MB pour la vue foyer.
-    Solde recalculé depuis les barres pour cohérence.
+    Solde foyer = somme des soldes individuels.
     """
     result = []
     for a, b in zip(rows_ca, rows_mb):
         entrees = a['entrees'] + b['entrees']
         sorties = a['sorties'] + b['sorties']
-        # Solde foyer = somme des soldes individuels
         sol = None
         if a['sol_fin'] is not None and b['sol_fin'] is not None:
             sol = round(a['sol_fin'] + b['sol_fin'], 2)

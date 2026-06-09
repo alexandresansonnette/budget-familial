@@ -16,6 +16,12 @@ def render(D):
     m_now, y_now = now.month - 1, now.year
     last_day = calendar.monthrange(y_now, m_now + 1)[1]
 
+    # ── Init session state pour coches et one-shots ───────────────────────
+    if "evt_coches" not in st.session_state:
+        st.session_state.evt_coches = {}
+    if "evt_one_shot" not in st.session_state:
+        st.session_state.evt_one_shot = {}
+
     st.markdown(f"#### Cockpit — {now.strftime('%d/%m/%Y')}")
 
     # ── Bandeau soldes bancaires ──────────────────────────────────────────
@@ -29,14 +35,13 @@ def render(D):
                 "warn" if sol_b is not None and sol_b < (-od + 300) else "ok")
             border = {"ok": "#1D9E75", "warn": "#D97706", "danger": "#E24B4A"}[s]
             sol_color = "#E24B4A" if (sol_b or 0) < 0 else "#1D9E75"
-            deb = D['sol'].get(f"{cpt_id}_{m_now}_{m_now}")
             deb = D['sol'].get(f"{cpt_id}_{y_now}_{m_now}")
             mc_html = ""
             if cpt_id == 'ca':
                 mc_enc = mc_depenses_mois(D['tx'], m_now, y_now, jusqu_au=now)
                 mc_html = (
                     f"<div style='margin-top:6px;font-size:12px;color:#888'>"
-                    f"Encours MC : <span style='color:{COMPTES["mc"]["color"]};"
+                    f"Encours MC : <span style='color:{COMPTES['mc']['color']};"
                     f"font-weight:600'>−{fmt2(mc_enc)}</span></div>"
                 )
             st.markdown(
@@ -122,16 +127,21 @@ def render(D):
             x_futur = [j[0] for j in proj["jours"] if int(j[0][:2]) >= now.day]
             y_futur = [j[1] for j in proj["jours"] if int(j[0][:2]) >= now.day]
 
-            # Événements futurs
+            # Événements futurs pour le graphe
             evt_x, evt_y, evt_txt = [], [], []
             for date_s, sol_j, evts in proj["jours"]:
                 if evts and int(date_s[:2]) > now.day:
-                    evt_x.append(date_s)
-                    evt_y.append(sol_j)
-                    evt_txt.append("<br>".join(
-                        f"{'▲' if d>0 else '▼'} {n} : {'+' if d>0 else ''}{fmt2(d)}"
-                        for n, d in evts
-                    ))
+                    # evts = [(nom, delta, cle, is_coche), ...]
+                    lignes = []
+                    for n, d, cle, ic in evts:
+                        if not ic:  # exclure les cochés de l'affichage graphe
+                            lignes.append(
+                                f"{'▲' if d>0 else '▼'} {n} : {'+' if d>0 else ''}{fmt2(d)}"
+                            )
+                    if lignes:
+                        evt_x.append(date_s)
+                        evt_y.append(sol_j)
+                        evt_txt.append("<br>".join(lignes))
 
             all_y = [v for v in y_vals if v is not None]
             fig = go.Figure()
@@ -233,22 +243,99 @@ def render(D):
                     unsafe_allow_html=True
                 )
 
+        # ── Événements à venir avec cases à cocher ────────────────────────
         with col_evts:
             st.markdown("**📅 Événements à venir**")
-            all_evts = [(j[0], n, d) for j in proj["jours"] for n, d in j[2]]
+
+            # Initialiser les coches pour ce compte
+            if cpt_cockpit not in st.session_state.evt_coches:
+                st.session_state.evt_coches[cpt_cockpit] = set()
+
+            # Collecter tous les événements futurs
+            all_evts = []
+            for date_e, sol_j, evts in proj["jours"]:
+                day_int = int(date_e[:2])
+                if day_int > now.day:
+                    for nom_e, delta_e, cle, is_coche in evts:
+                        all_evts.append((date_e, nom_e, delta_e, cle, is_coche))
+
             if all_evts:
-                for date_e, nom_e, delta_e in all_evts:
+                for date_e, nom_e, delta_e, cle, is_coche in all_evts:
                     sign = "+" if delta_e > 0 else ""
                     c_e = "#1D9E75" if delta_e > 0 else "#E24B4A"
-                    st.markdown(
-                        f'<div style="padding:4px 0;border-bottom:1px solid #f0f0f0;font-size:13px;">'
-                        f'<span style="color:#888;width:50px;display:inline-block">{date_e}</span>'
-                        f' {nom_e} '
-                        f'<strong style="color:{c_e}">{sign}{fmt2(delta_e)}</strong></div>',
-                        unsafe_allow_html=True
+                    label_evt = (
+                        f"~~{date_e}  {nom_e}  {sign}{fmt2(delta_e)}~~"
+                        if is_coche
+                        else f"{date_e}  {nom_e}  **:{('green' if delta_e > 0 else 'red')}[{sign}{fmt2(delta_e)}]**"
                     )
+                    checked = st.checkbox(
+                        label=f"{date_e} — {nom_e} — {sign}{fmt2(delta_e)}",
+                        value=is_coche,
+                        key=f"coche_{cpt_cockpit}_{cle}"
+                    )
+                    if checked:
+                        st.session_state.evt_coches[cpt_cockpit].add(cle)
+                    else:
+                        st.session_state.evt_coches[cpt_cockpit].discard(cle)
             else:
                 st.info("Aucun événement planifié.")
+
+            # ── Ajouter un événement ponctuel ──────────────────────────────
+            st.markdown("---")
+            with st.expander("➕ Ajouter un événement ponctuel", expanded=False):
+                with st.form(key=f"form_oneshot_{cpt_cockpit}", clear_on_submit=True):
+                    col_j, col_n = st.columns([1, 2])
+                    with col_j:
+                        jour_os = st.number_input(
+                            "Jour", min_value=1, max_value=last_day,
+                            value=min(now.day + 1, last_day), step=1
+                        )
+                    with col_n:
+                        nom_os = st.text_input("Libellé")
+                    col_m, col_t = st.columns([1, 1])
+                    with col_m:
+                        mnt_os = st.number_input(
+                            "Montant (€)", min_value=0.01, value=100.0, step=10.0
+                        )
+                    with col_t:
+                        type_os = st.selectbox(
+                            "Type", ["depense", "revenu"],
+                            format_func=lambda x: "Dépense 💸" if x == "depense" else "Revenu 💰"
+                        )
+                    submitted = st.form_submit_button("➕ Ajouter", use_container_width=True)
+                    if submitted and nom_os.strip():
+                        if cpt_cockpit not in st.session_state.evt_one_shot:
+                            st.session_state.evt_one_shot[cpt_cockpit] = []
+                        st.session_state.evt_one_shot[cpt_cockpit].append({
+                            "jour": int(jour_os),
+                            "nom": nom_os.strip(),
+                            "montant": float(mnt_os),
+                            "type": type_os,
+                        })
+                        st.rerun()
+
+                # Liste des one-shots existants avec suppression
+                os_list = st.session_state.get("evt_one_shot", {}).get(cpt_cockpit, [])
+                if os_list:
+                    st.markdown("*Événements ajoutés manuellement :*")
+                    for i, evt in enumerate(os_list):
+                        sign = "+" if evt["type"] == "revenu" else "−"
+                        c_os = st.columns([4, 1])
+                        with c_os[0]:
+                            c_e = "#1D9E75" if evt["type"] == "revenu" else "#E24B4A"
+                            st.markdown(
+                                f'<div style="font-size:12px;padding:2px 0;">'
+                                f'<span style="color:#888">{evt["jour"]:02d}/{m_now+1:02d}</span> '
+                                f'{evt["nom"]} '
+                                f'<strong style="color:{c_e}">{sign}{fmt2(evt["montant"])}</strong>'
+                                f'</div>',
+                                unsafe_allow_html=True
+                            )
+                        with c_os[1]:
+                            if st.button("🗑", key=f"del_os_{cpt_cockpit}_{i}",
+                                         use_container_width=True):
+                                st.session_state.evt_one_shot[cpt_cockpit].pop(i)
+                                st.rerun()
 
         # Recommandation
         st.markdown("---")
@@ -289,9 +376,7 @@ def render(D):
                 unsafe_allow_html=True
             )
 
-
-
-    # Dernières TX
+    # ── Dernières TX ───────────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("**Dernières transactions du mois**")
     tx_now = sorted(

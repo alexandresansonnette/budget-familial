@@ -13,6 +13,19 @@ MOIS = ['Janvier','Février','Mars','Avril','Mai','Juin',
         'Juillet','Août','Septembre','Octobre','Novembre','Décembre']
 MOIS_COURT = ['Jan','Fév','Mar','Avr','Mai','Jun','Jul','Aoû','Sep','Oct','Nov','Déc']
 
+# Mots-clés pour détecter le prélèvement Mastercard sur un relevé CA.
+# Cette ligne ne doit JAMAIS être importée : la MC est déjà déduite
+# automatiquement du solde CA par le modèle (mc_depenses_mois).
+MC_RELEVE_KEYWORDS = [
+    "mastercard", "master card", "debit differe", "débit différé",
+    "releve carte", "relevé carte", "retrait differe", "retrait différé",
+]
+
+
+def _is_releve_mc(libelle):
+    lib = libelle.lower()
+    return any(kw in lib for kw in MC_RELEVE_KEYWORDS)
+
 
 def render(D, persist, cur_m=None, cur_y=None):
     st.subheader("📋 Transactions")
@@ -141,28 +154,6 @@ def render(D, persist, cur_m=None, cur_y=None):
         st.info("Aucune transaction pour ce filtre.")
         return
 
-    # Construction du DataFrame d'affichage
-    rows = []
-    for t in tx_show:
-        d = datetime.strptime(t["date"], "%Y-%m-%d")
-        cpt_lbl = COMPTES.get(t["compte"], {"label": t["compte"]})["label"].split()[0]
-        sign = "+" if t["type"] == "revenu" else "−"
-        aff = ""
-        if t["compte"] == "mc":
-            aff = f"→ {MOIS_COURT[t['affM']]} {t['affY']}"
-        rows.append({
-            "_id": t["id"],
-            "Date": d.strftime("%d/%m/%Y"),
-            "Compte": cpt_lbl,
-            "Catégorie": t["categorie"],
-            "Note": t.get("note", ""),
-            "Montant": f"{sign}{fmt2(t['montant'])}",
-            "Affectation MC": aff,
-            "⭐": "⭐" if t.get("exceptionnel") else "",
-        })
-
-    df = pd.DataFrame(rows)
-
     # Affichage avec expanders pour édition
     for t in tx_show:
         d = datetime.strptime(t["date"], "%Y-%m-%d")
@@ -234,6 +225,9 @@ def render(D, persist, cur_m=None, cur_y=None):
                     # Lire l'affectation MC depuis session_state (valeur du selectbox au moment du submit)
                     final_aff_m = st.session_state.get(f"eaff_m_{t['id']}", aff_m_val)
                     final_aff_y = st.session_state.get(f"eaff_y_{t['id']}", aff_y_val)
+                    # Sécurité : une TX MC doit toujours avoir une affectation
+                    if new_cpt == "mc" and (final_aff_m is None or final_aff_y is None):
+                        final_aff_m, final_aff_y = mc_aff_from_date(date_str)
                     idx = next(i for i, x in enumerate(D["tx"]) if x["id"] == t["id"])
                     D["tx"][idx] = {
                         **t,
@@ -289,27 +283,30 @@ def _render_saisie(D, persist, default_cpt, default_m, default_y):
             tx_exc = st.checkbox("⭐ Exceptionnelle (exclue du prévisionnel)", value=False)
 
         # Affectation MC : auto depuis date + override manuel possible
-        override_aff_m = override_aff_y = None
         if tx_cpt == "mc":
             auto_m, auto_y = mc_aff_from_date(tx_date.strftime("%Y-%m-%d"))
             st.caption(f"💳 Affectation calculée : **{MOIS[auto_m]} {auto_y}**  *(modifiable ci-dessous si nécessaire)*")
             ov1, ov2 = st.columns(2)
             # Clé dépend de la date → Streamlit réinitialise le selectbox si la date change
             date_key = tx_date.strftime("%Y%m%d")
-            override_aff_m = ov1.selectbox("Mois affectation", range(12),
-                                            index=auto_m, format_func=lambda x: MOIS[x],
-                                            key=f"saisie_aff_m_{date_key}")
-            override_aff_y = ov2.selectbox("Année", list(range(2024, 2029)),
-                                            index=list(range(2024, 2029)).index(auto_y) if auto_y in range(2024, 2029) else 0,
-                                            key=f"saisie_aff_y_{date_key}")
+            ov1.selectbox("Mois affectation", range(12),
+                          index=auto_m, format_func=lambda x: MOIS[x],
+                          key=f"saisie_aff_m_{date_key}")
+            ov2.selectbox("Année", list(range(2024, 2029)),
+                          index=list(range(2024, 2029)).index(auto_y) if auto_y in range(2024, 2029) else 0,
+                          key=f"saisie_aff_y_{date_key}")
 
         if st.form_submit_button("✅ Ajouter", type="primary", use_container_width=True):
             date_str = tx_date.strftime("%Y-%m-%d")
             st.session_state.saisie_last_date = tx_date  # mémoriser la date
             aff_m, aff_y = (None, None)
             if tx_cpt == "mc":
-                aff_m = st.session_state.get("saisie_sel_m", auto_m)
-                aff_y = st.session_state.get("saisie_sel_y", auto_y)
+                # FIX v2.1 : lire les VRAIES clés des selectbox d'override
+                # (avant : clés "saisie_sel_m"/"saisie_sel_y" inexistantes
+                #  → l'override manuel était silencieusement ignoré)
+                date_key = tx_date.strftime("%Y%m%d")
+                aff_m = st.session_state.get(f"saisie_aff_m_{date_key}", auto_m)
+                aff_y = st.session_state.get(f"saisie_aff_y_{date_key}", auto_y)
 
             new_tx = {
                 "id": f"tx_{int(datetime.now().timestamp()*1000)}",
@@ -338,6 +335,11 @@ def _render_import_csv(D, persist):
     cpt_import = st.selectbox("Compte concerné", list(COMPTES.keys()),
                               format_func=lambda x: COMPTES[x]["label"],
                               key="import_cpt")
+
+    if cpt_import == "ca":
+        st.warning("💳 Les lignes « prélèvement Mastercard » du relevé CA seront "
+                   "**décochées automatiquement** : la MC est déjà déduite du "
+                   "solde CA par l'app. Les importer créerait un double comptage.")
 
     uploaded = st.file_uploader("Fichier CSV", type=["csv"], key="import_csv")
     if not uploaded:
@@ -400,10 +402,18 @@ def _render_import_csv(D, persist):
     # Tableau de validation
     st.markdown(f"**{len(pending)} transactions à valider :**")
     validated = []
+    n_mc_releve = 0
     for i, row in enumerate(pending):
+        # GARDE-FOU v2.1 : prélèvement MC sur relevé CA → décoché par défaut
+        is_releve_mc = cpt_import == "ca" and _is_releve_mc(row["libelle"])
+        if is_releve_mc:
+            n_mc_releve += 1
+
         c1, c2, c3, c4 = st.columns([2, 3, 2, 1])
         c1.text(row["date"])
         c2.text(row["libelle"][:40])
+        if is_releve_mc:
+            c2.caption("💳 Prélèvement MC — déjà déduit par l'app, ne pas importer")
         # Catégorie proposée
         proposed = _guess_cat(row["libelle"], cats)
         cat_sel = c3.selectbox(
@@ -413,9 +423,13 @@ def _render_import_csv(D, persist):
             key=f"imp_cat_{i}",
             label_visibility="collapsed"
         )
-        incl = c4.checkbox("✓", value=True, key=f"imp_incl_{i}")
+        incl = c4.checkbox("✓", value=not is_releve_mc, key=f"imp_incl_{i}")
         if incl:
             validated.append({**row, "categorie": cat_sel})
+
+    if n_mc_releve:
+        st.info(f"💳 {n_mc_releve} ligne(s) de prélèvement Mastercard détectée(s) "
+                f"et décochée(s) automatiquement.")
 
     if st.button(f"✅ Importer {len(validated)} transactions", type="primary"):
         added = 0

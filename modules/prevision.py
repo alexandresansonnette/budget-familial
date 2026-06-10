@@ -106,9 +106,14 @@ def build_monthly_data(D, cpt_id, n_past=6, n_future=5):
 
         else:
             # ── FUTUR : estimation depuis sol_propage ─────────────────────
+            # FIX v2.2c : les barres excluent les récurrentes neutres
+            # (Virement interne, Épargne) — cohérent avec le passé.
+            # MAIS le flux neutre reste appliqué au solde par compte :
+            # un virement CA→MB diminue bien le solde CA et augmente MB.
             entrees = _estimate_rev(D, cpt_id, hist_rev, revenu_cible)
             sorties = _estimate_dep(D, cpt_id, hist_dep, budget_cible, m)
-            sol_fin = round(sol_propage + entrees - sorties, 2)
+            flux_neutre = _rec_neutre_net(D, cpt_id)
+            sol_fin = round(sol_propage + entrees - sorties + flux_neutre, 2)
             sol_propage = sol_fin
 
         rows.append({
@@ -182,6 +187,18 @@ def _build_hist_rev(D, cpt_id, cm, cy, n_past):
     return hist
 
 
+def _rec_neutre_net(D, cpt_id):
+    """
+    Flux net mensuel des récurrentes NEUTRES (Virement interne, Épargne)
+    pour un compte. Exclu des barres d'affichage mais appliqué au solde :
+    un virement CA→MB diminue réellement le solde CA et augmente MB.
+    """
+    return sum(r['mnt'] if r['type'] == 'revenu' else -r['mnt']
+               for r in D['rec']
+               if r['compte'] == cpt_id
+               and r.get('cat') in CATS_NEUTRES)
+
+
 def _estimate_rev(D, cpt_id, hist_rev, revenu_cible):
     """
     Estime les revenus futurs.
@@ -189,9 +206,12 @@ def _estimate_rev(D, cpt_id, hist_rev, revenu_cible):
     (saisis comme vraies TX). On soustrait donc rec_rev de la moyenne
     historique pour n'estimer que la part VARIABLE, sinon double comptage
     et prévisionnel gonflé (futur ≈ passé + récurrentes).
+    FIX v2.2c : récurrentes NEUTRES (Virement interne, Épargne) exclues
+    des barres — cohérent avec le passé (_real_month exclut CATS_NEUTRES).
     """
     rec_rev = sum(r['mnt'] for r in D['rec']
-                  if r['compte'] == cpt_id and r['type'] == 'revenu')
+                  if r['compte'] == cpt_id and r['type'] == 'revenu'
+                  and r.get('cat') not in CATS_NEUTRES)
 
     if hist_rev:
         hist_filt = _iqr_filter(hist_rev)
@@ -220,12 +240,16 @@ def _estimate_dep(D, cpt_id, hist_dep, budget_cible, target_m):
     Estime les dépenses futures.
     FIX v2.2 : même logique que _estimate_rev — l'historique contient déjà
     les dépenses récurrentes, on soustrait rec_dep pour isoler le variable.
+    FIX v2.2c : récurrentes NEUTRES (Virement interne, Épargne) exclues
+    des barres — cohérent avec le passé (_real_month exclut CATS_NEUTRES).
     """
     rec_dep = sum(r['mnt'] for r in D['rec']
-                  if r['compte'] == cpt_id and r['type'] == 'depense')
+                  if r['compte'] == cpt_id and r['type'] == 'depense'
+                  and r.get('cat') not in CATS_NEUTRES)
     if cpt_id == 'ca':
         rec_dep += sum(r['mnt'] for r in D['rec']
-                       if r['compte'] == 'mc' and r['type'] == 'depense')
+                       if r['compte'] == 'mc' and r['type'] == 'depense'
+                       and r.get('cat') not in CATS_NEUTRES)
 
     if hist_dep:
         hist_filt = _iqr_filter(hist_dep)

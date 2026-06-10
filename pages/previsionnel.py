@@ -289,6 +289,11 @@ def render(D, persist=None):
             st.dataframe(pd.DataFrame(df_rows).set_index('Mois'),
                          use_container_width=True)
 
+    # ══ DÉCOMPOSITION DU PRÉVISIONNEL (v2.3) ═══════════════════════════════
+    with st.expander("🔍 Décomposition du prévisionnel — comment le futur est calculé",
+                     expanded=False):
+        _render_decomposition(D)
+
     # ══ BUDGET CIBLE ═══════════════════════════════════════════════════════
     with st.expander("🎯 Budget cible mensuel", expanded=False):
         bc_cpt = st.radio("Compte", ['ca', 'mb'],
@@ -348,3 +353,123 @@ def render(D, persist=None):
             else:
                 st.warning("⚠️ Fonction de sauvegarde non disponible "
                            "(persist non transmis par budget.py).")
+
+
+# ══ v2.3 : Décomposition transparente du prévisionnel ═════════════════════
+def _render_decomposition(D):
+    """
+    Affiche, par compte, le détail exact du calcul des sorties/entrées
+    prévues : récurrentes (avec neutres à part) + budget cible par
+    catégorie, et détecte les DOUBLONS (catégorie présente à la fois
+    en récurrente et en budget cible).
+    """
+    from modules.data import CATS_NEUTRES
+    from modules.prevision import _rec_neutre_net
+
+    st.caption(
+        "**Sorties prévues** = récurrentes dépenses (hors neutres) + budget cible  |  "
+        "**Entrées prévues** = récurrentes revenus (hors neutres) + revenu cible/variable  |  "
+        "Les neutres (Virement interne, Épargne) sont exclus des barres "
+        "mais appliqués au solde."
+    )
+
+    for cpt_id in ['ca', 'mb']:
+        cpt = COMPTES[cpt_id]
+        st.markdown(f"### {cpt['label']}")
+
+        # ── Récurrentes du compte (+ MC pour CA) ──────────────────────────
+        recs = [r for r in D['rec'] if r['compte'] == cpt_id]
+        recs_mc = [r for r in D['rec'] if r['compte'] == 'mc'] if cpt_id == 'ca' else []
+
+        rec_dep_rows, rec_rev_rows, rec_neutre_rows = [], [], []
+        for r in recs + recs_mc:
+            via_mc = " (via MC)" if r['compte'] == 'mc' else ""
+            row = {
+                "Nom": r['nom'] + via_mc,
+                "Catégorie": r.get('cat', '—'),
+                "Jour": r['jour'],
+                "Montant": fmt2(r['mnt']),
+                "_mnt": r['mnt'],
+                "_cat": r.get('cat', ''),
+            }
+            if r.get('cat') in CATS_NEUTRES:
+                row["Sens"] = "+" if r['type'] == 'revenu' else "−"
+                rec_neutre_rows.append(row)
+            elif r['type'] == 'depense':
+                rec_dep_rows.append(row)
+            else:
+                rec_rev_rows.append(row)
+
+        tot_rec_dep = sum(r["_mnt"] for r in rec_dep_rows)
+        tot_rec_rev = sum(r["_mnt"] for r in rec_rev_rows)
+
+        # ── Budget cible du compte ────────────────────────────────────────
+        bc = {k: float(v) for k, v in
+              D.get('budget_cible', {}).get(cpt_id, {}).items() if float(v) > 0}
+        tot_cible = sum(bc.values())
+        rc = float(D.get('revenu_cible', {}).get(cpt_id, 0))
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            st.markdown(f"**💸 Sorties prévues : {fmt2(tot_rec_dep + tot_cible)}**")
+            st.markdown(f"*Récurrentes dépenses — {fmt2(tot_rec_dep)}*")
+            if rec_dep_rows:
+                st.dataframe(
+                    pd.DataFrame(rec_dep_rows)[["Nom", "Catégorie", "Jour", "Montant"]],
+                    hide_index=True, use_container_width=True
+                )
+            else:
+                st.caption("Aucune récurrente dépense.")
+            st.markdown(f"*Budget cible (variable) — {fmt2(tot_cible)}*")
+            if bc:
+                st.dataframe(
+                    pd.DataFrame([{"Catégorie": k, "Montant": fmt2(v)}
+                                  for k, v in sorted(bc.items())]),
+                    hide_index=True, use_container_width=True
+                )
+            else:
+                st.caption("Budget cible vide → fallback sur l'historique.")
+
+        with c2:
+            rc_label = fmt2(rc) if rc > 0 else "historique variable"
+            st.markdown(f"**💰 Entrées prévues : {fmt2(tot_rec_rev + rc)}"
+                        f"{'' if rc > 0 else ' + variable'}**")
+            st.markdown(f"*Récurrentes revenus — {fmt2(tot_rec_rev)}*")
+            if rec_rev_rows:
+                st.dataframe(
+                    pd.DataFrame(rec_rev_rows)[["Nom", "Catégorie", "Jour", "Montant"]],
+                    hide_index=True, use_container_width=True
+                )
+            else:
+                st.caption("Aucune récurrente revenu.")
+            st.markdown(f"*Revenu cible : {rc_label}*")
+
+            if rec_neutre_rows:
+                flux = _rec_neutre_net(D, cpt_id)
+                st.markdown(f"*Neutres (hors barres, dans le solde) — "
+                            f"net : {fmt2(flux)}*")
+                st.dataframe(
+                    pd.DataFrame(rec_neutre_rows)[["Sens", "Nom", "Catégorie", "Montant"]],
+                    hide_index=True, use_container_width=True
+                )
+
+        # ── Détection des doublons récurrentes ↔ budget cible ─────────────
+        cats_rec_dep = {r["_cat"] for r in rec_dep_rows if r["_cat"]}
+        doublons = sorted(cats_rec_dep & set(bc.keys()))
+        if doublons:
+            for cat_d in doublons:
+                rec_cat_tot = sum(r["_mnt"] for r in rec_dep_rows
+                                  if r["_cat"] == cat_d)
+                st.error(
+                    f"⚠️ **Doublon probable « {cat_d} »** : "
+                    f"{fmt2(rec_cat_tot)} en récurrentes **ET** "
+                    f"{fmt2(bc[cat_d])} en budget cible. "
+                    f"Si les récurrentes couvrent déjà cette catégorie, "
+                    f"mettez le budget cible « {cat_d} » à 0 — "
+                    f"sinon elle est comptée deux fois dans le prévisionnel."
+                )
+        else:
+            st.success("✓ Aucun doublon récurrente ↔ budget cible détecté.")
+
+        st.divider()

@@ -83,8 +83,10 @@ def build_monthly_data(D, cpt_id, n_past=6, n_future=5):
             else:
                 sol_debut = sol_propage  # propagé depuis le mois précédent
 
-            # Barres d'affichage : hors catégories neutres
+            # Barres : hors neutres (foyer) + tout inclus (détail par compte)
             entrees, sorties = _real_month(D, cpt_id, m, y)
+            entrees_tot, sorties_tot = _real_month(D, cpt_id, m, y,
+                                                   include_neutres=True)
 
             if m == cm and y == cy:
                 # ── Mois courant : projection complète fin de mois ────────
@@ -112,7 +114,18 @@ def build_monthly_data(D, cpt_id, n_past=6, n_future=5):
             # un virement CA→MB diminue bien le solde CA et augmente MB.
             entrees = _estimate_rev(D, cpt_id, hist_rev, revenu_cible)
             sorties = _estimate_dep(D, cpt_id, hist_dep, budget_cible, m)
-            flux_neutre = _rec_neutre_net(D, cpt_id)
+            # Récurrentes neutres (virements internes, épargne)
+            rec_neutre_rev = sum(r['mnt'] for r in D['rec']
+                                 if r['compte'] == cpt_id
+                                 and r['type'] == 'revenu'
+                                 and r.get('cat') in CATS_NEUTRES)
+            rec_neutre_dep = sum(r['mnt'] for r in D['rec']
+                                 if r['compte'] == cpt_id
+                                 and r['type'] == 'depense'
+                                 and r.get('cat') in CATS_NEUTRES)
+            entrees_tot = entrees + rec_neutre_rev
+            sorties_tot = sorties + rec_neutre_dep
+            flux_neutre = rec_neutre_rev - rec_neutre_dep
             sol_fin = round(sol_propage + entrees - sorties + flux_neutre, 2)
             sol_propage = sol_fin
 
@@ -120,6 +133,8 @@ def build_monthly_data(D, cpt_id, n_past=6, n_future=5):
             'label': label, 'm': m, 'y': y,
             'entrees': round(entrees, 2),
             'sorties': round(sorties, 2),
+            'entrees_tot': round(entrees_tot, 2),
+            'sorties_tot': round(sorties_tot, 2),
             'sol_fin': sol_fin,
             'is_fc': is_fc,
         })
@@ -127,12 +142,17 @@ def build_monthly_data(D, cpt_id, n_past=6, n_future=5):
     return rows, get_sol(D['sol'], cpt_id, cm, cy)
 
 
-def _real_month(D, cpt_id, m, y):
-    """Entrées et sorties réelles d'un mois (hors neutres) — pour les BARRES."""
+def _real_month(D, cpt_id, m, y, include_neutres=False):
+    """
+    Entrées et sorties réelles d'un mois — pour les BARRES.
+    include_neutres=False : hors neutres (vue FOYER, virements s'annulent)
+    include_neutres=True  : tout inclus (vue DÉTAIL PAR COMPTE — un virement
+                            CA→MB est un vrai flux pour chaque compte)
+    """
     tx_m = [t for t in D['tx']
             if t['compte'] == cpt_id
             and aff_key(t) == (y, m)
-            and t.get('categorie') not in CATS_NEUTRES]
+            and (include_neutres or t.get('categorie') not in CATS_NEUTRES)]
     entrees = sum(t['montant'] for t in tx_m if t['type'] == 'revenu')
     sorties = sum(t['montant'] for t in tx_m if t['type'] == 'depense')
 
@@ -142,7 +162,7 @@ def _real_month(D, cpt_id, m, y):
                  if t['compte'] == 'mc'
                  and t['type'] == 'depense'
                  and aff_key(t) == (y, m)
-                 and t.get('categorie') not in CATS_NEUTRES]
+                 and (include_neutres or t.get('categorie') not in CATS_NEUTRES)]
         sorties += sum(t['montant'] for t in mc_tx)
 
     return entrees, sorties

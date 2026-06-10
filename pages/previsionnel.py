@@ -14,14 +14,21 @@ from datetime import datetime
 MOIS_COURT = ['Jan','Fév','Mar','Avr','Mai','Jun','Jul','Aoû','Sep','Oct','Nov','Déc']
 
 
-def _bar_chart(rows, color, title, od=0):
-    """Graphique barres entrées/sorties + ligne solde pour un compte ou le foyer."""
+def _bar_chart(rows, color, title, od=0, use_tot=False):
+    """
+    Graphique barres entrées/sorties + ligne solde.
+    use_tot=False : barres hors neutres (vue FOYER — virements s'annulent)
+    use_tot=True  : barres tout inclus (vue DÉTAIL PAR COMPTE — les
+                    virements internes et l'épargne sont de vrais flux)
+    """
     now = datetime.now()
     today_lbl = mois_label(now.month - 1, now.year)
 
-    labels  = [r['label']   for r in rows]
-    entrees = [r['entrees'] for r in rows]
-    sorties = [r['sorties'] for r in rows]
+    k_e = 'entrees_tot' if use_tot else 'entrees'
+    k_s = 'sorties_tot' if use_tot else 'sorties'
+    labels  = [r['label'] for r in rows]
+    entrees = [r.get(k_e, r['entrees']) for r in rows]
+    sorties = [r.get(k_s, r['sorties']) for r in rows]
     sols    = [r['sol_fin'] for r in rows]
     is_fc   = [r['is_fc']   for r in rows]
 
@@ -262,11 +269,14 @@ def render(D, persist=None):
 
     # ══ DÉTAIL PAR COMPTE (expander) ══════════════════════════════════════
     with st.expander("📊 Voir le détail par compte", expanded=False):
+        st.caption("Vue par compte : les virements internes et l'épargne sont "
+                   "**inclus** ici (vrais flux du compte), contrairement à la "
+                   "vue foyer où ils s'annulent.")
         for cpt_id, rows_c in [('ca', rows_ca), ('mb', rows_mb)]:
             cpt = COMPTES[cpt_id]
             od = D['overdraft'].get(cpt_id, 0)
             fig_d = _bar_chart(rows_c, cpt['color'],
-                               cpt['label'], od=od)
+                               cpt['label'], od=od, use_tot=True)
             st.plotly_chart(fig_d, use_container_width=True)
 
     # ══ TABLEAU MENSUEL ════════════════════════════════════════════════════
@@ -305,17 +315,23 @@ def render(D, persist=None):
         MOIS_NOMS = ['Janvier','Février','Mars','Avril','Mai','Juin',
                      'Juillet','Août','Septembre','Octobre','Novembre','Décembre']
 
-        from modules.data import visible_cats
-        cats_bc = sorted(set(visible_cats(D)) - {'Virement interne', 'Épargne',
-                                                   'ARE / Salaire', 'Allocations',
-                                                   'Revenu freelance'})
+        # FIX v2.3 : TOUTES les catégories (même masquées) apparaissent ici.
+        # Le masquage ne concerne que la saisie de NOUVELLES transactions.
+        # Sinon : une catégorie masquée avec un budget cible devient invisible
+        # → risque de double saisie (ex. Frais divers masqué + Divers).
+        from modules.data import all_cats, visible_cats
+        vis_set = set(visible_cats(D))
+        cats_bc = sorted(set(all_cats(D)) - {'Virement interne', 'Épargne',
+                                              'ARE / Salaire', 'Allocations',
+                                              'Revenu freelance'})
         changed = False
         cols_bc = st.columns(3)
         new_bc = dict(bc_data)
         for i, cat in enumerate(cats_bc):
             with cols_bc[i % 3]:
                 cur = float(bc_data.get(cat, 0))
-                val = st.number_input(cat, value=cur, min_value=0.0,
+                label_cat = cat if cat in vis_set else f"🙈 {cat} (masquée)"
+                val = st.number_input(label_cat, value=cur, min_value=0.0,
                                       step=10.0, format="%.0f",
                                       key=f"bc_{bc_cpt}_{cat}")
                 if val != cur:

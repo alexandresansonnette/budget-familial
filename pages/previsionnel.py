@@ -380,7 +380,7 @@ def _render_decomposition(D):
     en récurrente et en budget cible).
     """
     from modules.data import CATS_NEUTRES
-    from modules.prevision import _rec_neutre_net
+    from modules.prevision import _rec_neutre_net, detail_estimation
 
     st.caption(
         "**Sorties prévues** = récurrentes dépenses (hors neutres) + budget cible  |  "
@@ -388,10 +388,65 @@ def _render_decomposition(D):
         "Les neutres (Virement interne, Épargne) sont exclus des barres "
         "mais appliqués au solde."
     )
+    st.info(
+        "🧠 **Apprentissage borné (v2.4)** : la prévision part du PLAN "
+        "(récurrentes + cible), puis se corrige de **50 % de l'écart** avec "
+        "le réalisé moyen des derniers mois (hors ⭐, outliers exclus), "
+        "**plafonné à ±15 % du plan**, et seulement à partir de 3 mois "
+        "d'historique. Si une récurrente augmente sans mise à jour, la "
+        "prévision converge doucement vers la réalité sans jamais s'emballer."
+    )
 
     for cpt_id in ['ca', 'mb']:
         cpt = COMPTES[cpt_id]
         st.markdown(f"### {cpt['label']}")
+
+        # ── v2.3b : MOIS COURANT — détail du calcul ───────────────────────
+        # Le mois courant n'utilise PAS récurrentes+cible : son solde de fin
+        # vient de projection_fin_mois() (même moteur que le cockpit) :
+        # solde bancaire ancré aujourd'hui + événements futurs du mois.
+        from modules.calculs import projection_fin_mois
+        proj = projection_fin_mois(D, cpt_id)
+        now_dec = datetime.now()
+        mois_cur = ['Janvier','Février','Mars','Avril','Mai','Juin','Juillet',
+                    'Août','Septembre','Octobre','Novembre','Décembre'][now_dec.month - 1]
+        with st.container(border=True):
+            st.markdown(f"**🗓️ Mois courant ({mois_cur}) — comment son solde de fin "
+                        f"est calculé**")
+            if proj["solde_actuel"] is None:
+                st.warning("Solde de début de mois non renseigné.")
+            else:
+                evt_rows, tot_evt = [], 0.0
+                for date_e, _sol_j, evts in proj["jours"]:
+                    for nom_e, delta_e, _cle, is_coche in evts:
+                        if is_coche:
+                            continue  # événement coché = exclu du calcul
+                        evt_rows.append({
+                            "Date": date_e,
+                            "Événement": nom_e,
+                            "Montant": ("+" if delta_e > 0 else "−") + fmt2(abs(delta_e)),
+                        })
+                        tot_evt += delta_e
+                sol_banc = solde_bancaire(D, cpt_id)
+                st.markdown(
+                    f"Solde bancaire **aujourd'hui** (ancrage) : "
+                    f"**{fmt2(sol_banc)}**  →  + événements restants du mois "
+                    f"({fmt2(tot_evt)})  =  solde fin {mois_cur} : "
+                    f"**{fmt2(proj['solde_fin'])}**"
+                )
+                if evt_rows:
+                    st.dataframe(pd.DataFrame(evt_rows), hide_index=True,
+                                 use_container_width=True)
+                    st.caption(
+                        "Événements = TX futures déjà saisies + récurrentes "
+                        "restantes non couvertes"
+                        + (" + prélèvement MC estimé en fin de mois"
+                           if cpt_id == 'ca' else "")
+                        + ". Identique au cockpit Aujourd'hui ; les barres de "
+                        "ce mois sur le graphe ne montrent que le réalisé à date."
+                    )
+                else:
+                    st.caption("Aucun événement restant ce mois.")
 
         # ── Récurrentes du compte (+ MC pour CA) ──────────────────────────
         recs = [r for r in D['rec'] if r['compte'] == cpt_id]
@@ -487,5 +542,37 @@ def _render_decomposition(D):
                 )
         else:
             st.success("✓ Aucun doublon récurrente ↔ budget cible détecté.")
+
+        # ── v2.4 : Apprentissage — Plan vs Réalisé vs Estimation ──────────
+        det = detail_estimation(D, cpt_id)
+        st.markdown("**🧠 Apprentissage : du plan à l'estimation**")
+        app_rows = []
+        for sens, lbl in [('dep', '💸 Dépenses'), ('rev', '💰 Revenus')]:
+            d_ = det[sens]
+            if d_['correction'] is None:
+                corr_txt = "— (pas de cible ou < 3 mois)"
+            elif d_['correction'] == 0:
+                corr_txt = "0 (plan = réalisé ou historique insuffisant)"
+            else:
+                corr_txt = f"{'+' if d_['correction'] > 0 else ''}{fmt2(d_['correction'])}"
+            app_rows.append({
+                "": lbl,
+                "Plan (réc. + cible)": fmt2(d_['plan']),
+                f"Réalisé moy. ({d_['n_hist']} mois)":
+                    fmt2(d_['realise']) if d_['realise'] is not None else "—",
+                "Correction appliquée": corr_txt,
+                "Estimation finale": fmt2(d_['estimation']),
+            })
+        st.dataframe(pd.DataFrame(app_rows), hide_index=True,
+                     use_container_width=True)
+        d_dep = det['dep']
+        if (d_dep['correction'] is not None and d_dep['plan'] > 0
+                and abs(d_dep['correction']) >= 0.14 * d_dep['plan'] * 0.5):
+            st.warning(
+                "📌 La correction dépenses est proche de sa borne (±15 % du "
+                "plan) : ton réalisé s'écarte durablement de ton plan. "
+                "Vérifie tes récurrentes (montants à jour ?) ou recalibre "
+                "le budget cible."
+            )
 
         st.divider()

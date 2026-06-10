@@ -219,49 +219,75 @@ def _rec_neutre_net(D, cpt_id):
                and r.get('cat') in CATS_NEUTRES)
 
 
+# ── v2.4 : Apprentissage borné ────────────────────────────────────────────
+# La prévision part du PLAN (récurrentes + cible) puis se corrige doucement
+# vers le RÉALISÉ historique, dans des limites strictes :
+ALPHA_APPRENTISSAGE = 0.5    # fraction de la correction appliquée (50 %)
+CLAMP_CORRECTION    = 0.15   # correction max : ±15 % du plan
+MIN_HIST_APPRENT    = 3      # mois d'historique requis pour apprendre
+
+
+def _hist_avg(hist):
+    """Moyenne pondérée récente de l'historique (IQR + poids exponentiels)."""
+    if not hist:
+        return None
+    hist_filt = _iqr_filter(hist)
+    if hist_filt:
+        w = np.exp(-0.2 * np.arange(len(hist_filt) - 1, -1, -1))
+        return float(np.average(hist_filt, weights=w))
+    return float(np.median(hist))
+
+
+def _apprentissage(plan, hist):
+    """
+    Correction bornée du plan vers le réalisé.
+    Retourne (estimation, correction_appliquée, réalisé_moyen).
+    Garde-fous : ≥3 mois d'historique, correction plafonnée à ±15 % du plan,
+    et seulement 50 % de l'écart appliqué (convergence douce).
+    """
+    realise = _hist_avg(hist)
+    if realise is None or len(hist) < MIN_HIST_APPRENT or plan <= 0:
+        return plan, 0.0, realise
+    correction = realise - plan
+    borne = CLAMP_CORRECTION * plan
+    correction = max(-borne, min(borne, correction))
+    correction = ALPHA_APPRENTISSAGE * correction
+    return plan + correction, correction, realise
+
+
 def _estimate_rev(D, cpt_id, hist_rev, revenu_cible):
     """
     Estime les revenus futurs.
-    FIX v2.2 : l'historique (hist_rev) contient DÉJÀ les revenus récurrents
-    (saisis comme vraies TX). On soustrait donc rec_rev de la moyenne
-    historique pour n'estimer que la part VARIABLE, sinon double comptage
-    et prévisionnel gonflé (futur ≈ passé + récurrentes).
-    FIX v2.2c : récurrentes NEUTRES (Virement interne, Épargne) exclues
-    des barres — cohérent avec le passé (_real_month exclut CATS_NEUTRES).
+    v2.4 : PLAN (récurrentes + revenu cible) + apprentissage borné vers le
+    réalisé historique (hors ⭐, hors neutres, outliers IQR filtrés).
+    Si un abonnement/revenu récurrent change sans mise à jour de la
+    récurrente, la prévision converge doucement vers la réalité (max ±15 %).
+    Sans cible : fallback sur la part variable historique (v2.2).
     """
     rec_rev = sum(r['mnt'] for r in D['rec']
                   if r['compte'] == cpt_id and r['type'] == 'revenu'
                   and r.get('cat') not in CATS_NEUTRES)
 
-    if hist_rev:
-        hist_filt = _iqr_filter(hist_rev)
-        if hist_filt:
-            w = np.exp(-0.2 * np.arange(len(hist_filt) - 1, -1, -1))
-            avg_total = float(np.average(hist_filt, weights=w))
-        else:
-            avg_total = float(np.median(hist_rev))
-        # Part variable = total historique − récurrentes (déjà incluses dans les TX)
-        avg_var = max(0.0, avg_total - rec_rev)
-    else:
-        avg_var = 0.0
-
-    # FIX v2.2b : le revenu cible, s'il est renseigné, est la SOURCE PRINCIPALE.
-    # L'historique ne sert que de fallback quand aucune cible n'est définie.
-    # (Les TX exceptionnelles ⭐ sont déjà exclues de hist_rev, mais celles
-    #  non marquées gonflaient l'estimation — la cible évite ce biais.)
     if revenu_cible > 0:
-        avg_var = revenu_cible
+        plan = rec_rev + revenu_cible
+        estimation, _, _ = _apprentissage(plan, hist_rev)
+        return estimation
 
+    # Fallback sans cible : part variable historique
+    avg_total = _hist_avg(hist_rev)
+    avg_var = max(0.0, (avg_total or 0.0) - rec_rev)
     return rec_rev + avg_var
 
 
 def _estimate_dep(D, cpt_id, hist_dep, budget_cible, target_m):
     """
     Estime les dépenses futures.
-    FIX v2.2 : même logique que _estimate_rev — l'historique contient déjà
-    les dépenses récurrentes, on soustrait rec_dep pour isoler le variable.
-    FIX v2.2c : récurrentes NEUTRES (Virement interne, Épargne) exclues
-    des barres — cohérent avec le passé (_real_month exclut CATS_NEUTRES).
+    v2.4 : PLAN (récurrentes + budget cible) + apprentissage borné vers le
+    réalisé historique. Si une charge récurrente augmente sans mise à jour
+    (abonnement, assurance…), l'écart apparaît dans le réalisé et la
+    prévision converge doucement vers la réalité (max ±15 % du plan,
+    50 % de l'écart appliqué, ≥3 mois d'historique requis).
+    Sans cible : fallback sur la part variable historique (v2.2).
     """
     rec_dep = sum(r['mnt'] for r in D['rec']
                   if r['compte'] == cpt_id and r['type'] == 'depense'
@@ -271,26 +297,63 @@ def _estimate_dep(D, cpt_id, hist_dep, budget_cible, target_m):
                        if r['compte'] == 'mc' and r['type'] == 'depense'
                        and r.get('cat') not in CATS_NEUTRES)
 
-    if hist_dep:
-        hist_filt = _iqr_filter(hist_dep)
-        if hist_filt:
-            w = np.exp(-0.2 * np.arange(len(hist_filt) - 1, -1, -1))
-            avg_total = float(np.average(hist_filt, weights=w))
-        else:
-            avg_total = float(np.median(hist_dep))
-        # Part variable = total historique − récurrentes (déjà incluses dans les TX)
-        avg_var = max(0.0, avg_total - rec_dep)
-    else:
-        avg_var = 0.0
-
-    # FIX v2.2b : le budget cible, s'il est renseigné, est la SOURCE PRINCIPALE.
-    # L'historique ne sert que de fallback quand aucune cible n'est définie.
-    # Prévision = récurrentes + budget cible → cohérent, prévisible, pilotable.
     cible_total = sum(budget_cible.values())
     if cible_total > 0:
-        avg_var = cible_total
+        plan = rec_dep + cible_total
+        estimation, _, _ = _apprentissage(plan, hist_dep)
+        return estimation
 
+    # Fallback sans cible : part variable historique
+    avg_total = _hist_avg(hist_dep)
+    avg_var = max(0.0, (avg_total or 0.0) - rec_dep)
     return rec_dep + avg_var
+
+
+def detail_estimation(D, cpt_id, n_past=6):
+    """
+    v2.4 : décomposition complète de l'estimation pour l'affichage
+    (panneau Décomposition). Retourne un dict par sens (dep/rev) :
+    plan, réalisé moyen, correction appliquée, estimation finale.
+    """
+    from datetime import datetime as _dt
+    now = _dt.now()
+    cm, cy = now.month - 1, now.year
+    hist_dep = _build_hist_dep(D, cpt_id, cm, cy, n_past)
+    hist_rev = _build_hist_rev(D, cpt_id, cm, cy, n_past)
+
+    rec_dep = sum(r['mnt'] for r in D['rec']
+                  if r['compte'] == cpt_id and r['type'] == 'depense'
+                  and r.get('cat') not in CATS_NEUTRES)
+    if cpt_id == 'ca':
+        rec_dep += sum(r['mnt'] for r in D['rec']
+                       if r['compte'] == 'mc' and r['type'] == 'depense'
+                       and r.get('cat') not in CATS_NEUTRES)
+    rec_rev = sum(r['mnt'] for r in D['rec']
+                  if r['compte'] == cpt_id and r['type'] == 'revenu'
+                  and r.get('cat') not in CATS_NEUTRES)
+
+    cible_dep = sum(D.get('budget_cible', {}).get(cpt_id, {}).values())
+    cible_rev = float(D.get('revenu_cible', {}).get(cpt_id, 0))
+
+    out = {}
+    for sens, rec, cible, hist in [('dep', rec_dep, cible_dep, hist_dep),
+                                   ('rev', rec_rev, cible_rev, hist_rev)]:
+        plan = rec + cible
+        if cible > 0:
+            estimation, corr, realise = _apprentissage(plan, hist)
+        else:
+            realise = _hist_avg(hist)
+            estimation = rec + max(0.0, (realise or 0.0) - rec)
+            corr = None  # pas d'apprentissage sans cible
+        out[sens] = {
+            'rec': round(rec, 2), 'cible': round(cible, 2),
+            'plan': round(plan, 2),
+            'realise': round(realise, 2) if realise is not None else None,
+            'correction': round(corr, 2) if corr is not None else None,
+            'estimation': round(estimation, 2),
+            'n_hist': len(hist),
+        }
+    return out
 
 
 def _iqr_filter(vals):

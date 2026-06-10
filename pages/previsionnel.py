@@ -571,8 +571,102 @@ def _render_decomposition(D):
             st.warning(
                 "📌 La correction dépenses est proche de sa borne (±15 % du "
                 "plan) : ton réalisé s'écarte durablement de ton plan. "
-                "Vérifie tes récurrentes (montants à jour ?) ou recalibre "
-                "le budget cible."
+                "Le tableau ci-dessous montre **quelle catégorie** dérive."
             )
 
+        # ── v2.4b : Réalisé vs Plan PAR CATÉGORIE ─────────────────────────
+        st.markdown("**📊 Réalisé vs Plan par catégorie (dépenses, "
+                    "6 derniers mois, hors ⭐)**")
+        cat_rows = _realise_vs_plan_par_cat(D, cpt_id, bc, rec_dep_rows)
+        if cat_rows:
+            st.dataframe(pd.DataFrame(cat_rows), hide_index=True,
+                         use_container_width=True)
+            st.caption(
+                "🔴 = dérive significative (>20 € ET >25 % du plan). "
+                "**Comment corriger** : si la catégorie contient une "
+                "récurrente (loyer, abonnement…), vérifie son montant dans "
+                "Paramètres → Récurrentes. Sinon, ajuste le budget cible "
+                "ci-dessous — ou marque ⭐ les TX exceptionnelles qui "
+                "polluent le réalisé."
+            )
+        else:
+            st.caption("Pas assez d'historique pour la comparaison.")
+
         st.divider()
+
+
+# ══ v2.4b : Réalisé vs Plan par catégorie ═════════════════════════════════
+def _realise_vs_plan_par_cat(D, cpt_id, bc, rec_dep_rows, n_past=6):
+    """
+    Compare, catégorie par catégorie, le plan (budget cible + récurrentes
+    de la catégorie) au réalisé moyen des n_past derniers mois.
+    Réalisé : TX dépenses réelles (hors ⭐, hors neutres), affectation
+    aff_key, MC incluse pour CA. Moyenne sur les mois ayant des données.
+    Retourne les lignes triées par |écart| décroissant.
+    """
+    from collections import defaultdict
+    from modules.calculs import aff_key, month_add
+    from modules.data import CATS_NEUTRES
+
+    now = datetime.now()
+    cm, cy = now.month - 1, now.year
+    months = {month_add(cm, cy, -i) for i in range(1, n_past + 1)}
+    months = {(y_, m_) for m_, y_ in months}  # aff_key retourne (y, m)
+
+    tot_par_cat = defaultdict(float)
+    mois_actifs = set()
+    for t in D['tx']:
+        if t['type'] != 'depense':
+            continue
+        if t.get('exceptionnel', False):
+            continue
+        if t.get('categorie') in CATS_NEUTRES:
+            continue
+        cpt_t = t['compte']
+        if cpt_t != cpt_id and not (cpt_id == 'ca' and cpt_t == 'mc'):
+            continue
+        ak = aff_key(t)
+        if ak not in months:
+            continue
+        tot_par_cat[t['categorie']] += t['montant']
+        mois_actifs.add(ak)
+
+    n_actifs = len(mois_actifs)
+    if n_actifs == 0:
+        return []
+
+    # Plan par catégorie : récurrentes (cat) + budget cible (cat)
+    rec_par_cat = defaultdict(float)
+    for r in rec_dep_rows:  # déjà filtrées : dépenses non neutres, MC incluse
+        if r["_cat"]:
+            rec_par_cat[r["_cat"]] += r["_mnt"]
+
+    toutes_cats = set(tot_par_cat) | set(rec_par_cat) | set(bc)
+    rows = []
+    for cat in toutes_cats:
+        plan_c = rec_par_cat.get(cat, 0.0) + bc.get(cat, 0.0)
+        real_c = tot_par_cat.get(cat, 0.0) / n_actifs
+        ecart = real_c - plan_c
+        derive = abs(ecart) > 20 and (plan_c == 0 or abs(ecart) > 0.25 * plan_c)
+        rows.append({
+            "Catégorie": cat,
+            "Plan/mois": fmt2(plan_c),
+            f"Réalisé moy. ({n_actifs} mois)": fmt2(real_c),
+            "Écart": f"{'+' if ecart > 0 else ''}{fmt2(ecart)}",
+            "⚠": "🔴" if derive else ("🟠" if abs(ecart) > 20 else ""),
+            "_abs": abs(ecart),
+        })
+    rows.sort(key=lambda r: -r["_abs"])
+    for r in rows:
+        r.pop("_abs")
+    # Ligne TOTAL
+    tot_plan = sum(rec_par_cat.values()) + sum(bc.values())
+    tot_real = sum(tot_par_cat.values()) / n_actifs
+    rows.append({
+        "Catégorie": "— TOTAL —",
+        "Plan/mois": fmt2(tot_plan),
+        f"Réalisé moy. ({n_actifs} mois)": fmt2(tot_real),
+        "Écart": f"{'+' if tot_real - tot_plan > 0 else ''}{fmt2(tot_real - tot_plan)}",
+        "⚠": "",
+    })
+    return rows

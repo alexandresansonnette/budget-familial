@@ -205,10 +205,12 @@ def _estimate_rev(D, cpt_id, hist_rev, revenu_cible):
     else:
         avg_var = 0.0
 
+    # FIX v2.2b : le revenu cible, s'il est renseigné, est la SOURCE PRINCIPALE.
+    # L'historique ne sert que de fallback quand aucune cible n'est définie.
+    # (Les TX exceptionnelles ⭐ sont déjà exclues de hist_rev, mais celles
+    #  non marquées gonflaient l'estimation — la cible évite ce biais.)
     if revenu_cible > 0:
-        n = len(hist_rev)
-        w_cible = max(0.0, (12 - n) / 12)
-        avg_var = (1 - w_cible) * avg_var + w_cible * revenu_cible
+        avg_var = revenu_cible
 
     return rec_rev + avg_var
 
@@ -237,11 +239,12 @@ def _estimate_dep(D, cpt_id, hist_dep, budget_cible, target_m):
     else:
         avg_var = 0.0
 
+    # FIX v2.2b : le budget cible, s'il est renseigné, est la SOURCE PRINCIPALE.
+    # L'historique ne sert que de fallback quand aucune cible n'est définie.
+    # Prévision = récurrentes + budget cible → cohérent, prévisible, pilotable.
     cible_total = sum(budget_cible.values())
     if cible_total > 0:
-        n = len(hist_dep)
-        w_cible = max(0.0, (12 - n) / 12)
-        avg_var = (1 - w_cible) * avg_var + w_cible * cible_total
+        avg_var = cible_total
 
     return rec_dep + avg_var
 

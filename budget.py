@@ -1,5 +1,5 @@
 """
-Budget Familial AS — v2
+Budget Familial AS — v2.1
 Architecture modulaire, source unique de vérité.
 """
 import sys, os
@@ -113,7 +113,8 @@ with tabs[1]:
     render_transactions(D, persist, cur_m=M, cur_y=Y)
 
 with tabs[2]:
-    render_previsionnel(D)
+    # FIX v2.1 : persist transmis pour la sauvegarde du budget cible
+    render_previsionnel(D, persist)
 
 with tabs[3]:
     render_parametres(D, persist, M, Y)

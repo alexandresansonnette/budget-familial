@@ -7,12 +7,18 @@ Règles :
 - Futur : récurrentes + budget cible (moyenne pondérée si historique suffisant)
 - MC : intégrée dans CA (débit différé)
 - Virements internes / Épargne : exclus des barres (neutres pour le foyer)
+  mais INCLUS dans la propagation du solde (ils bougent réellement l'argent)
+- Mois courant : ancré sur projection_fin_mois (récurrentes restantes
+  + prélèvement MC inclus) — cohérent avec le cockpit Aujourd'hui
 """
 import numpy as np
 from datetime import datetime
 from collections import defaultdict
 from modules.data import CATS_NEUTRES, CATS_REVENUS
-from modules.calculs import aff_key, month_add, resolve_sol, mc_depenses_mois, get_sol, solde_bancaire
+from modules.calculs import (
+    aff_key, month_add, resolve_sol, mc_depenses_mois, get_sol,
+    solde_bancaire, projection_fin_mois, _mvt_net
+)
 
 
 MOIS_COURT = ['Jan','Fév','Mar','Avr','Mai','Jun','Jul','Aoû','Sep','Oct','Nov','Déc']
@@ -27,8 +33,11 @@ def build_monthly_data(D, cpt_id, n_past=6, n_future=5):
     Construit les données mensuelles pour un compte sur n_past + 1 + n_future mois.
 
     Passé : pour chaque mois, on réancre sur le solde saisi si disponible,
-            puis on applique les TX réelles pour obtenir sol_fin.
-    Futur : on part du solde bancaire ancré d'aujourd'hui, puis on estime
+            puis on propage via le mouvement net RÉEL (_mvt_net — toutes TX,
+            y compris neutres) pour obtenir sol_fin.
+    Mois courant : sol_fin = projection complète fin de mois
+            (solde bancaire ancré + récurrentes restantes + prélèvement MC).
+    Futur : on part de cette projection, puis on estime
             via récurrentes + historique.
 
     Retourne une liste de dicts :
@@ -74,14 +83,24 @@ def build_monthly_data(D, cpt_id, n_past=6, n_future=5):
             else:
                 sol_debut = sol_propage  # propagé depuis le mois précédent
 
+            # Barres d'affichage : hors catégories neutres
             entrees, sorties = _real_month(D, cpt_id, m, y)
 
-            # Pour le mois courant : ancrage sur solde_bancaire réel
             if m == cm and y == cy:
-                sol_fin_reel = solde_bancaire(D, cpt_id)
-                sol_fin = sol_fin_reel if sol_fin_reel is not None else round(sol_debut + entrees - sorties, 2)
+                # ── Mois courant : projection complète fin de mois ────────
+                # (récurrentes restantes + prélèvement MC inclus)
+                # → cohérent avec le cockpit Aujourd'hui
+                proj = projection_fin_mois(D, cpt_id)
+                if proj["solde_fin"] is not None:
+                    sol_fin = round(proj["solde_fin"], 2)
+                else:
+                    sol_fin = round(sol_debut + _mvt_net(D, cpt_id, m, y), 2)
             else:
-                sol_fin = round(sol_debut + entrees - sorties, 2)
+                # ── Mois passé : propagation sur mouvement net réel ───────
+                # _mvt_net inclut TOUTES les TX (y compris virements internes
+                # et épargne) + déduit la MC pour CA — contrairement aux
+                # barres qui excluent les neutres pour la lisibilité.
+                sol_fin = round(sol_debut + _mvt_net(D, cpt_id, m, y), 2)
 
             sol_propage = sol_fin  # pour le mois suivant si pas d'ancrage
 
@@ -104,7 +123,7 @@ def build_monthly_data(D, cpt_id, n_past=6, n_future=5):
 
 
 def _real_month(D, cpt_id, m, y):
-    """Entrées et sorties réelles d'un mois (hors neutres)."""
+    """Entrées et sorties réelles d'un mois (hors neutres) — pour les BARRES."""
     tx_m = [t for t in D['tx']
             if t['compte'] == cpt_id
             and aff_key(t) == (y, m)

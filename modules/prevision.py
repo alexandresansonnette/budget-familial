@@ -183,7 +183,13 @@ def _build_hist_rev(D, cpt_id, cm, cy, n_past):
 
 
 def _estimate_rev(D, cpt_id, hist_rev, revenu_cible):
-    """Estime les revenus futurs."""
+    """
+    Estime les revenus futurs.
+    FIX v2.2 : l'historique (hist_rev) contient DÉJÀ les revenus récurrents
+    (saisis comme vraies TX). On soustrait donc rec_rev de la moyenne
+    historique pour n'estimer que la part VARIABLE, sinon double comptage
+    et prévisionnel gonflé (futur ≈ passé + récurrentes).
+    """
     rec_rev = sum(r['mnt'] for r in D['rec']
                   if r['compte'] == cpt_id and r['type'] == 'revenu')
 
@@ -191,9 +197,11 @@ def _estimate_rev(D, cpt_id, hist_rev, revenu_cible):
         hist_filt = _iqr_filter(hist_rev)
         if hist_filt:
             w = np.exp(-0.2 * np.arange(len(hist_filt) - 1, -1, -1))
-            avg_var = float(np.average(hist_filt, weights=w))
+            avg_total = float(np.average(hist_filt, weights=w))
         else:
-            avg_var = float(np.median(hist_rev))
+            avg_total = float(np.median(hist_rev))
+        # Part variable = total historique − récurrentes (déjà incluses dans les TX)
+        avg_var = max(0.0, avg_total - rec_rev)
     else:
         avg_var = 0.0
 
@@ -206,7 +214,11 @@ def _estimate_rev(D, cpt_id, hist_rev, revenu_cible):
 
 
 def _estimate_dep(D, cpt_id, hist_dep, budget_cible, target_m):
-    """Estime les dépenses futures."""
+    """
+    Estime les dépenses futures.
+    FIX v2.2 : même logique que _estimate_rev — l'historique contient déjà
+    les dépenses récurrentes, on soustrait rec_dep pour isoler le variable.
+    """
     rec_dep = sum(r['mnt'] for r in D['rec']
                   if r['compte'] == cpt_id and r['type'] == 'depense')
     if cpt_id == 'ca':
@@ -217,9 +229,11 @@ def _estimate_dep(D, cpt_id, hist_dep, budget_cible, target_m):
         hist_filt = _iqr_filter(hist_dep)
         if hist_filt:
             w = np.exp(-0.2 * np.arange(len(hist_filt) - 1, -1, -1))
-            avg_var = float(np.average(hist_filt, weights=w))
+            avg_total = float(np.average(hist_filt, weights=w))
         else:
-            avg_var = float(np.median(hist_dep))
+            avg_total = float(np.median(hist_dep))
+        # Part variable = total historique − récurrentes (déjà incluses dans les TX)
+        avg_var = max(0.0, avg_total - rec_dep)
     else:
         avg_var = 0.0
 

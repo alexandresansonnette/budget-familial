@@ -119,10 +119,9 @@ def _bar_chart(rows, color, title, od=0):
     return fig
 
 
-def _carte_synthese(rows, cpt_id, cpt_info):
+def _carte_synthese(rows, cpt_id, cpt_info, od=0):
     """Carte synthétique solde fin période / point bas / tendance."""
     fc_rows = [r for r in rows if r['is_fc'] and r['sol_fin'] is not None]
-    od = 0  # pas de découvert foyer
 
     sol_fin_c = fc_rows[-1]['sol_fin'] if fc_rows else None
     sols_fc = [r['sol_fin'] for r in fc_rows]
@@ -200,6 +199,7 @@ def render(D, persist=None):
     # ══ BANDEAU SOLDES ACTUELS ════════════════════════════════════════════
     now_pv = datetime.now()
     m_now, y_now = now_pv.month - 1, now_pv.year
+    mc_color = COMPTES['mc']['color']
     b1, b2 = st.columns(2)
     for col, cpt_id in [(b1, 'ca'), (b2, 'mb')]:
         with col:
@@ -213,12 +213,14 @@ def render(D, persist=None):
             deb = D['sol'].get(f"{cpt_id}_{y_now}_{m_now}")
 
             # Encours MC pour CA
+            # NB : pas de guillemets doubles imbriqués dans la f-string
+            # (SyntaxError en Python < 3.12)
             mc_html = ""
             if cpt_id == 'ca':
                 mc_enc = mc_depenses_mois(D['tx'], m_now, y_now, jusqu_au=now_pv)
                 mc_html = (f"<div style='margin-top:6px;font-size:12px;color:#888'>"
                            f"Encours MC à ce jour : "
-                           f"<span style='color:{COMPTES["mc"]["color"]};font-weight:600'>"
+                           f"<span style='color:{mc_color};font-weight:600'>"
                            f"−{fmt2(mc_enc)}</span></div>")
 
             st.markdown(
@@ -245,12 +247,14 @@ def render(D, persist=None):
     c1, c2 = st.columns(2)
     with c1:
         st.markdown(
-            _carte_synthese(rows_ca, 'ca', COMPTES['ca']),
+            _carte_synthese(rows_ca, 'ca', COMPTES['ca'],
+                            od=D['overdraft'].get('ca', 0)),
             unsafe_allow_html=True
         )
     with c2:
         st.markdown(
-            _carte_synthese(rows_mb, 'mb', COMPTES['mb']),
+            _carte_synthese(rows_mb, 'mb', COMPTES['mb'],
+                            od=D['overdraft'].get('mb', 0)),
             unsafe_allow_html=True
         )
 
@@ -332,4 +336,15 @@ def render(D, persist=None):
             changed = True
 
         if changed:
-            st.success("✓ Budget cible mis à jour — sauvegarde à la prochaine action")
+            st.info("✏️ Modifications en attente — cliquez pour les sauvegarder.")
+
+        # FIX v2.1 : sauvegarde explicite du budget cible
+        # (avant : les modifications n'étaient jamais persistées depuis cet onglet)
+        if st.button("💾 Enregistrer le budget cible", use_container_width=True,
+                     key="bc_save_btn"):
+            if persist is not None:
+                persist()
+                st.success("✓ Budget cible sauvegardé dans Google Sheets.")
+            else:
+                st.warning("⚠️ Fonction de sauvegarde non disponible "
+                           "(persist non transmis par budget.py).")

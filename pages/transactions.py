@@ -341,59 +341,84 @@ def _render_import_csv(D, persist):
                    "**décochées automatiquement** : la MC est déjà déduite du "
                    "solde CA par l'app. Les importer créerait un double comptage.")
 
-    uploaded = st.file_uploader("Fichier CSV", type=["csv"], key="import_csv")
+    uploaded = st.file_uploader("Relevé bancaire (CSV ou PDF)",
+                                type=["csv", "pdf"], key="import_csv")
     if not uploaded:
         return
-
-    import csv, io
-    try:
-        content = uploaded.read().decode("utf-8-sig")
-        reader = csv.reader(io.StringIO(content), delimiter=";")
-        rows = list(reader)
-    except Exception as e:
-        st.error(f"Erreur lecture CSV : {e}")
-        return
-
-    if not rows:
-        st.warning("Fichier vide.")
-        return
-
-    # Détecter header
-    start = 1 if any(c.lower() in ["date", "libellé", "montant"] for c in rows[0]) else 0
-    st.info(f"{len(rows) - start} lignes détectées. Vérifiez les catégories avant d'importer.")
 
     cats = visible_cats(D)
     pending = []
 
-    for row in rows[start:]:
-        if len(row) < 3:
-            continue
+    # ── v2.5 étape 4 : RELEVÉ PDF ─────────────────────────────────────────
+    if uploaded.name.lower().endswith(".pdf"):
+        from modules.extraction_pdf import extraire_releve_pdf
+        annee_pdf = st.number_input(
+            "Année du relevé (si les dates du PDF sont en JJ/MM)",
+            min_value=2020, max_value=2035, value=datetime.now().year,
+            key="import_pdf_annee")
         try:
-            # Essayer différents formats de date
-            date_str = row[0].strip()
-            for fmt_d in ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"]:
-                try:
-                    d_obj = datetime.strptime(date_str, fmt_d)
-                    date_str = d_obj.strftime("%Y-%m-%d")
-                    break
-                except ValueError:
-                    continue
+            pending, n_carte = extraire_releve_pdf(uploaded,
+                                                   annee_defaut=int(annee_pdf))
+        except Exception as e:
+            st.error(f"Erreur extraction PDF : {e}")
+            return
+        if n_carte:
+            st.info(f"💳 {n_carte} ligne(s) de récapitulatif carte ignorée(s) "
+                    f"(déjà déduites par l'app).")
+        if not pending:
+            st.warning("Aucune opération détectée dans ce PDF — "
+                       "le format du relevé n'est peut-être pas tabulaire.")
+            return
+        st.info(f"{len(pending)} opérations extraites du PDF.")
 
-            libelle = row[1].strip()
-            # Montant : gérer virgule décimale et négatif
-            mnt_raw = row[2].strip().replace(" ", "").replace(",", ".")
-            mnt = float(mnt_raw)
-            tx_type = "revenu" if mnt > 0 else "depense"
-            mnt = abs(mnt)
+    # ── CSV ───────────────────────────────────────────────────────────────
+    else:
+        import csv, io
+        try:
+            content = uploaded.read().decode("utf-8-sig")
+            reader = csv.reader(io.StringIO(content), delimiter=";")
+            rows = list(reader)
+        except Exception as e:
+            st.error(f"Erreur lecture CSV : {e}")
+            return
 
-            pending.append({
-                "date": date_str,
-                "libelle": libelle,
-                "montant": mnt,
-                "type": tx_type,
-            })
-        except (ValueError, IndexError):
-            continue
+        if not rows:
+            st.warning("Fichier vide.")
+            return
+
+        # Détecter header
+        start = 1 if any(c.lower() in ["date", "libellé", "montant"] for c in rows[0]) else 0
+        st.info(f"{len(rows) - start} lignes détectées. Vérifiez les catégories avant d'importer.")
+
+        for row in rows[start:]:
+            if len(row) < 3:
+                continue
+            try:
+                # Essayer différents formats de date
+                date_str = row[0].strip()
+                for fmt_d in ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"]:
+                    try:
+                        d_obj = datetime.strptime(date_str, fmt_d)
+                        date_str = d_obj.strftime("%Y-%m-%d")
+                        break
+                    except ValueError:
+                        continue
+
+                libelle = row[1].strip()
+                # Montant : gérer virgule décimale et négatif
+                mnt_raw = row[2].strip().replace(" ", "").replace(",", ".")
+                mnt = float(mnt_raw)
+                tx_type = "revenu" if mnt > 0 else "depense"
+                mnt = abs(mnt)
+
+                pending.append({
+                    "date": date_str,
+                    "libelle": libelle,
+                    "montant": mnt,
+                    "type": tx_type,
+                })
+            except (ValueError, IndexError):
+                continue
 
     if not pending:
         st.warning("Aucune ligne valide détectée.")

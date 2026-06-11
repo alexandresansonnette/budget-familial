@@ -112,17 +112,19 @@ def build_monthly_data(D, cpt_id, n_past=6, n_future=5):
             # (Virement interne, Épargne) — cohérent avec le passé.
             # MAIS le flux neutre reste appliqué au solde par compte :
             # un virement CA→MB diminue bien le solde CA et augmente MB.
-            entrees = _estimate_rev(D, cpt_id, hist_rev, revenu_cible)
-            sorties = _estimate_dep(D, cpt_id, hist_dep, budget_cible, m)
-            # Récurrentes neutres (virements internes, épargne)
+            entrees = _estimate_rev(D, cpt_id, hist_rev, revenu_cible, m, y)
+            sorties = _estimate_dep(D, cpt_id, hist_dep, budget_cible, m, y)
+            # Récurrentes neutres (virements internes, épargne) ACTIVES
             rec_neutre_rev = sum(r['mnt'] for r in D['rec']
                                  if r['compte'] == cpt_id
                                  and r['type'] == 'revenu'
-                                 and r.get('cat') in CATS_NEUTRES)
+                                 and r.get('cat') in CATS_NEUTRES
+                                 and rec_active(r, m, y))
             rec_neutre_dep = sum(r['mnt'] for r in D['rec']
                                  if r['compte'] == cpt_id
                                  and r['type'] == 'depense'
-                                 and r.get('cat') in CATS_NEUTRES)
+                                 and r.get('cat') in CATS_NEUTRES
+                                 and rec_active(r, m, y))
             entrees_tot = entrees + rec_neutre_rev
             sorties_tot = sorties + rec_neutre_dep
             flux_neutre = rec_neutre_rev - rec_neutre_dep
@@ -207,16 +209,20 @@ def _build_hist_rev(D, cpt_id, cm, cy, n_past):
     return hist
 
 
-def _rec_neutre_net(D, cpt_id):
+def _rec_neutre_net(D, cpt_id, m=None, y=None):
     """
     Flux net mensuel des récurrentes NEUTRES (Virement interne, Épargne)
     pour un compte. Exclu des barres d'affichage mais appliqué au solde :
     un virement CA→MB diminue réellement le solde CA et augmente MB.
     """
+    if m is None or y is None:
+        from datetime import datetime as _dt
+        _n = _dt.now(); m, y = _n.month - 1, _n.year
     return sum(r['mnt'] if r['type'] == 'revenu' else -r['mnt']
                for r in D['rec']
                if r['compte'] == cpt_id
-               and r.get('cat') in CATS_NEUTRES)
+               and r.get('cat') in CATS_NEUTRES
+               and rec_active(r, m, y))
 
 
 # ── v2.4 : Apprentissage borné ────────────────────────────────────────────
@@ -255,7 +261,7 @@ def _apprentissage(plan, hist):
     return plan + correction, correction, realise
 
 
-def _estimate_rev(D, cpt_id, hist_rev, revenu_cible):
+def _estimate_rev(D, cpt_id, hist_rev, revenu_cible, m=None, y=None):
     """
     Estime les revenus futurs.
     v2.4 : PLAN (récurrentes + revenu cible) + apprentissage borné vers le
@@ -264,9 +270,13 @@ def _estimate_rev(D, cpt_id, hist_rev, revenu_cible):
     récurrente, la prévision converge doucement vers la réalité (max ±15 %).
     Sans cible : fallback sur la part variable historique (v2.2).
     """
+    if m is None or y is None:
+        from datetime import datetime as _dt
+        _n = _dt.now(); m, y = _n.month - 1, _n.year
     rec_rev = sum(r['mnt'] for r in D['rec']
                   if r['compte'] == cpt_id and r['type'] == 'revenu'
-                  and r.get('cat') not in CATS_NEUTRES)
+                  and r.get('cat') not in CATS_NEUTRES
+                  and rec_active(r, m, y))
 
     if revenu_cible > 0:
         plan = rec_rev + revenu_cible
@@ -279,7 +289,7 @@ def _estimate_rev(D, cpt_id, hist_rev, revenu_cible):
     return rec_rev + avg_var
 
 
-def _estimate_dep(D, cpt_id, hist_dep, budget_cible, target_m):
+def _estimate_dep(D, cpt_id, hist_dep, budget_cible, m=None, y=None):
     """
     Estime les dépenses futures.
     v2.4 : PLAN (récurrentes + budget cible) + apprentissage borné vers le
@@ -289,13 +299,18 @@ def _estimate_dep(D, cpt_id, hist_dep, budget_cible, target_m):
     50 % de l'écart appliqué, ≥3 mois d'historique requis).
     Sans cible : fallback sur la part variable historique (v2.2).
     """
+    if m is None or y is None:
+        from datetime import datetime as _dt
+        _n = _dt.now(); m, y = _n.month - 1, _n.year
     rec_dep = sum(r['mnt'] for r in D['rec']
                   if r['compte'] == cpt_id and r['type'] == 'depense'
-                  and r.get('cat') not in CATS_NEUTRES)
+                  and r.get('cat') not in CATS_NEUTRES
+                  and rec_active(r, m, y))
     if cpt_id == 'ca':
         rec_dep += sum(r['mnt'] for r in D['rec']
                        if r['compte'] == 'mc' and r['type'] == 'depense'
-                       and r.get('cat') not in CATS_NEUTRES)
+                       and r.get('cat') not in CATS_NEUTRES
+                       and rec_active(r, m, y))
 
     cible_total = sum(budget_cible.values())
     if cible_total > 0:
@@ -323,14 +338,17 @@ def detail_estimation(D, cpt_id, n_past=6):
 
     rec_dep = sum(r['mnt'] for r in D['rec']
                   if r['compte'] == cpt_id and r['type'] == 'depense'
-                  and r.get('cat') not in CATS_NEUTRES)
+                  and r.get('cat') not in CATS_NEUTRES
+                  and rec_active(r, cm, cy))
     if cpt_id == 'ca':
         rec_dep += sum(r['mnt'] for r in D['rec']
                        if r['compte'] == 'mc' and r['type'] == 'depense'
-                       and r.get('cat') not in CATS_NEUTRES)
+                       and r.get('cat') not in CATS_NEUTRES
+                       and rec_active(r, cm, cy))
     rec_rev = sum(r['mnt'] for r in D['rec']
                   if r['compte'] == cpt_id and r['type'] == 'revenu'
-                  and r.get('cat') not in CATS_NEUTRES)
+                  and r.get('cat') not in CATS_NEUTRES
+                  and rec_active(r, cm, cy))
 
     cible_dep = sum(D.get('budget_cible', {}).get(cpt_id, {}).values())
     cible_rev = float(D.get('revenu_cible', {}).get(cpt_id, 0))

@@ -88,8 +88,20 @@ def _render_recurrentes(D, persist):
     for r in recs:
         cpt = COMPTES.get(r["compte"], {"label": r["compte"]})
         sign = "+" if r["type"] == "revenu" else "−"
+        # v2.6 : badge d'état (actif / en pause / terminé)
+        from modules.calculs import rec_active
+        from datetime import datetime as _dt
+        _n = _dt.now()
+        actif_now = rec_active(r, _n.month - 1, _n.year)
+        if not actif_now and r.get("finY") is not None and \
+           (_n.year * 12 + _n.month - 1) > int(r["finY"]) * 12 + int(r["finM"]):
+            badge = " 🏁 terminée"
+        elif not actif_now:
+            badge = " ⏸️ en pause"
+        else:
+            badge = ""
         with st.expander(
-            f"{sign}{fmt2(r['mnt'])} — {r['nom']} — {cpt['label'].split()[0]} — j.{r['jour']}",
+            f"{sign}{fmt2(r['mnt'])} — {r['nom']} — {cpt['label'].split()[0]} — j.{r['jour']}{badge}",
             expanded=False
         ):
             with st.form(f"edit_rec_{r['id']}"):
@@ -111,10 +123,54 @@ def _render_recurrentes(D, persist):
                                            step=0.01, format="%.2f")
                     rjour = st.number_input("Jour du mois", value=min(int(r["jour"]), 28),
                                             min_value=1, max_value=28)
+
+                # ── v2.6 : Cycle de vie ───────────────────────────────────
+                st.caption("⏱ **Cycle de vie** (optionnel) — la récurrente "
+                           "disparaît du prévisionnel quand inactive")
+                opts_mois = ["—"] + MOIS
+                annees_cv = list(range(2024, 2033))
+
+                def _mk(label, key_m, key_y, cur_m, cur_y, col):
+                    with col:
+                        st.markdown(f"*{label}*")
+                        cm_, cy_ = st.columns(2)
+                        im = 0 if cur_m is None else int(cur_m) + 1
+                        sel_m = cm_.selectbox("Mois", opts_mois, index=im,
+                                              key=key_m, label_visibility="collapsed")
+                        iy = annees_cv.index(int(cur_y)) if cur_y is not None and int(cur_y) in annees_cv else 0
+                        sel_y = cy_.selectbox("Année", annees_cv, index=iy,
+                                              key=key_y, label_visibility="collapsed")
+                        if sel_m == "—":
+                            return None, None
+                        return opts_mois.index(sel_m) - 1, sel_y
+
+                cv1, cv2, cv3 = st.columns(3)
+                fin_m, fin_y = _mk("🏁 Fin (dernier mois)",
+                                   f"fin_m_{r['id']}", f"fin_y_{r['id']}",
+                                   r.get("finM"), r.get("finY"), cv1)
+                pd_m, pd_y = _mk("⏸️ Pause de",
+                                 f"pd_m_{r['id']}", f"pd_y_{r['id']}",
+                                 r.get("pdM"), r.get("pdY"), cv2)
+                pa_m, pa_y = _mk("▶️ Pause jusqu'à (incluse)",
+                                 f"pa_m_{r['id']}", f"pa_y_{r['id']}",
+                                 r.get("paM"), r.get("paY"), cv3)
+
                 if st.form_submit_button("💾 Enregistrer", use_container_width=True):
+                    # Lire les selectbox depuis session_state au submit
+                    def _rd(key_m, key_y):
+                        sm = st.session_state.get(key_m, "—")
+                        if sm == "—":
+                            return None, None
+                        return opts_mois.index(sm) - 1, st.session_state.get(key_y)
+                    fin_m, fin_y = _rd(f"fin_m_{r['id']}", f"fin_y_{r['id']}")
+                    pd_m, pd_y = _rd(f"pd_m_{r['id']}", f"pd_y_{r['id']}")
+                    pa_m, pa_y = _rd(f"pa_m_{r['id']}", f"pa_y_{r['id']}")
                     idx = next(i for i, x in enumerate(D["rec"]) if x["id"] == r["id"])
                     D["rec"][idx] = {**r, "nom": rn, "compte": rc, "cat": rcat,
-                                     "mnt": float(rmnt), "type": rt, "jour": int(rjour)}
+                                     "mnt": float(rmnt), "type": rt, "jour": int(rjour),
+                                     "finM": fin_m, "finY": fin_y,
+                                     "pdM": pd_m, "pdY": pd_y,
+                                     "paM": pa_m, "paY": pa_y}
                     persist(); st.success("✓"); st.rerun()
             if st.button("🗑 Supprimer", key=f"del_rec_{r['id']}"):
                 D["rec"] = [x for x in D["rec"] if x["id"] != r["id"]]

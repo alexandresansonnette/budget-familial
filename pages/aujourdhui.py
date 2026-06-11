@@ -232,7 +232,7 @@ def render(D):
                 mc_tot = mc_depenses_mois(D["tx"], m_now, y_now)
                 mc_rest = mc_tot - mc_enc
                 from modules.calculs import mc_rec_total
-                mc_rest += mc_rec_total(D["rec"])
+                mc_rest += mc_rec_total(D["rec"], m_now, y_now)
                 st.markdown(
                     f'<div style="border:1px solid #e0e0e0;border-radius:10px;'
                     f'padding:12px;text-align:center;margin-top:8px;">'

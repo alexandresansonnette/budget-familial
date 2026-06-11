@@ -45,10 +45,38 @@ def mc_depenses_mois(tx, m, y, jusqu_au=None):
     return sum(t["montant"] for t in txs)
 
 
-def mc_rec_total(rec):
-    """Total mensuel des récurrentes MC dépenses."""
+# ── Cycle de vie des récurrentes (v2.6) ──────────────────────────────────────
+def rec_active(r, m, y):
+    """
+    True si la récurrente est active pour le mois (m 0-indexed, y).
+    Champs optionnels sur r :
+      finM/finY   : dernier mois actif (date de fin connue)
+      pdM/pdY     : début de pause (suspension)
+      paM/paY     : fin de pause — absente = suspension indéfinie
+    """
+    a = y * 12 + m
+    if r.get("finY") is not None and r.get("finM") is not None:
+        if a > int(r["finY"]) * 12 + int(r["finM"]):
+            return False
+    if r.get("pdY") is not None and r.get("pdM") is not None:
+        debut_pause = int(r["pdY"]) * 12 + int(r["pdM"])
+        if r.get("paY") is not None and r.get("paM") is not None:
+            fin_pause = int(r["paY"]) * 12 + int(r["paM"])
+            if debut_pause <= a <= fin_pause:
+                return False
+        elif a >= debut_pause:  # pause sans date de fin = indéfinie
+            return False
+    return True
+
+
+def mc_rec_total(rec, m=None, y=None):
+    """Total mensuel des récurrentes MC dépenses (actives pour m, y)."""
+    if m is None or y is None:
+        now = datetime.now()
+        m, y = now.month - 1, now.year
     return sum(r["mnt"] for r in rec
-               if r["compte"] == "mc" and r["type"] == "depense")
+               if r["compte"] == "mc" and r["type"] == "depense"
+               and rec_active(r, m, y))
 
 
 # ── Soldes ───────────────────────────────────────────────────────────────────
@@ -207,6 +235,8 @@ def rec_futures(D, cpt_id):
     for r in D["rec"]:
         if r["compte"] != cpt_id:
             continue
+        if not rec_active(r, m, y):
+            continue
         if r["jour"] <= now.day:
             continue
         if r["nom"].strip().lower() in tx_noms:
@@ -289,6 +319,8 @@ def projection_fin_mois(D, cpt_id):
     for r in D["rec"]:
         if r["compte"] != cpt_id:
             continue
+        if not rec_active(r, m, y):
+            continue  # v2.6 : suspendue ou terminée
         if r["jour"] <= now.day:
             continue  # jour passé, déjà dans l'ancrage
         if _rec_deja_couverte(r, tx_mois):
@@ -304,6 +336,8 @@ def projection_fin_mois(D, cpt_id):
         for r in D["rec"]:
             if r["compte"] != "mc" or r["type"] != "depense":
                 continue
+            if not rec_active(r, m, y):
+                continue  # v2.6
             deja = any(
                 t["type"] == "depense"
                 and abs(t["montant"] - r["mnt"]) / max(r["mnt"], 0.01) <= 0.02

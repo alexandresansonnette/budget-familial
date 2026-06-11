@@ -404,17 +404,23 @@ def _render_import_csv(D, persist):
     # Libellé reconnu par le registre → catégorie pré-remplie.
     # Libellé inconnu → choix + mot-clé (tronc pré-extrait) MÉMORISÉ
     # dans D['cat_keywords'] à l'import → automatique la fois suivante.
-    from modules.categorisation import extraire_tronc, guess_cat, memoriser_mot_cle
+    from modules.categorisation import (extraire_tronc, guess_cat,
+                                        memoriser_mot_cle, est_op_opaque,
+                                        cle_op, memoriser_op)
     from collections import defaultdict
 
     groupes_lib = defaultdict(list)
     for row in pending:
         groupes_lib[row["libelle"]].append(row)
 
-    connus, inconnus, mc_releves = [], [], []
+    connus, inconnus, mc_releves, opaques = [], [], [], []
     for lib, rows_g in groupes_lib.items():
         if cpt_import == "ca" and _is_releve_mc(lib):
             mc_releves.append((lib, rows_g))
+            continue
+        # v2.5 ét.3 : chèques / P2P / virements opaques → traitement individuel
+        if est_op_opaque(lib):
+            opaques += rows_g
             continue
         proposed = guess_cat(D, lib, cats)
         if proposed and proposed in cats:
@@ -426,13 +432,42 @@ def _render_import_csv(D, persist):
     st.markdown(f"**{len(pending)} lignes → {len(groupes_lib)} libellés distincts** : "
                 f"{len(connus)} reconnus ({n_tx_ok} TX), "
                 f"{len(inconnus)} à catégoriser, "
+                f"{len(opaques)} opaque(s), "
                 f"{len(mc_releves)} prélèvement(s) MC ignoré(s).")
     if mc_releves:
         st.info("💳 Prélèvements Mastercard exclus (déjà déduits par l'app) : "
                 + " · ".join(lib[:35] for lib, _ in mc_releves))
 
     validated = []
-    a_memoriser = []  # [(cat, mot_cle)] à apprendre à l'import
+    a_memoriser = []      # [(cat, mot_cle)] → registre de mots-clés
+    a_memoriser_ops = []  # [(date, libelle, cat)] → ops_connues
+
+    # ── Opérations OPAQUES : chèques, P2P, virements sans tronc ──────────
+    # Une par une (le destinataire change), mémoire par (date, libellé).
+    if opaques:
+        st.markdown("**✍️ Opérations opaques — à catégoriser une par une "
+                    "(chèque, Wero/Lydia, virement sans détail) :**")
+        st.caption("Mémorisées individuellement par date+libellé — "
+                   "jamais transformées en mot-clé général.")
+        ops_connues = D.get("ops_connues", {})
+        for oi, row in enumerate(sorted(opaques, key=lambda r: r["date"])):
+            cle = cle_op(row["date"], row["libelle"])
+            deja = ops_connues.get(cle)
+            c1, c2, c3 = st.columns([3, 2, 1])
+            sign = "+" if row["type"] == "revenu" else "−"
+            c1.write(f"{row['date']} · **{row['libelle'][:38]}**")
+            c1.caption(f"{sign}{fmt2(row['montant'])}"
+                       + (" · 🧠 déjà connue" if deja else ""))
+            opts = ["— Choisir —"] + cats
+            idx = opts.index(deja) if deja in opts else 0
+            cat_sel = c2.selectbox("Cat.", opts, index=idx,
+                                   key=f"imp_op_cat_{oi}",
+                                   label_visibility="collapsed")
+            incl = c3.checkbox("✓", value=True, key=f"imp_op_ok_{oi}")
+            if incl and cat_sel != "— Choisir —":
+                validated.append({**row, "categorie": cat_sel})
+                if cat_sel != deja:
+                    a_memoriser_ops.append((row["date"], row["libelle"], cat_sel))
 
     # ── Libellés INCONNUS : choix + mot-clé mémorisé ──────────────────────
     if inconnus:
@@ -509,10 +544,14 @@ def _render_import_csv(D, persist):
             added += 1
         n_appris = sum(1 for cat, mot in a_memoriser
                        if memoriser_mot_cle(D, cat, mot))
+        for d_op, lib_op, cat_op in a_memoriser_ops:
+            memoriser_op(D, d_op, lib_op, cat_op)
         persist()
         msg = f"✓ {added} transactions importées."
         if n_appris:
             msg += f" 🧠 {n_appris} mot(s)-clé(s) mémorisé(s)."
+        if a_memoriser_ops:
+            msg += f" ✍️ {len(a_memoriser_ops)} opération(s) opaque(s) mémorisée(s)."
         st.success(msg)
         st.rerun()
 

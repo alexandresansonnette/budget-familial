@@ -154,6 +154,10 @@ def migrate(data):
         from modules.categorisation import SEED_KEYWORDS
         data["cat_keywords"] = {k: list(v) for k, v in SEED_KEYWORDS.items()}
 
+    # v2.5 étape 3 : mémoire individuelle des opérations opaques
+    if "ops_connues" not in data:
+        data["ops_connues"] = {}
+
     return data
 
 

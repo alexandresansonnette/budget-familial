@@ -101,3 +101,47 @@ SEED_KEYWORDS = {
     "Loisirs / Vacances": ["RESTAURANT", "CINEMA", "HOTEL", "BOOKING"],
     "Impôts / Taxes": ["IMPOT", "DGFIP", "TRESOR PUBLIC"],
 }
+
+
+# ══ v2.5 étape 3 : Opérations OPAQUES ═══════════════════════════════════════
+# Chèques, virements P2P (Wero, Paylib, Lydia…) et virements sans tronc
+# distinctif : le mot-clé ne généralise pas (destinataire différent à chaque
+# fois). On les mémorise INDIVIDUELLEMENT par (date, libellé) dans
+# D['ops_connues'] — jamais dans le registre de mots-clés.
+
+_RE_CHEQUE = re.compile(r"^\s*ch[eè]que\s+\d+\s*$", re.IGNORECASE)
+_SERVICES_P2P = ("wero", "paylib", "lydia", "sumeria")
+
+
+def est_cheque(libelle: str) -> bool:
+    return bool(_RE_CHEQUE.match(libelle.strip()))
+
+
+def est_op_opaque(libelle: str) -> bool:
+    """
+    Virement ou paiement dont le tronc distinctif est vide ou trop vague,
+    ou service P2P (destinataire variable). À catégoriser individuellement.
+    """
+    lib = libelle.strip()
+    if est_cheque(lib):
+        return True
+    if any(s in lib.lower() for s in _SERVICES_P2P):
+        return True
+    est_vir = bool(re.match(r"^(vir(ement)?\s)", lib, re.IGNORECASE))
+    est_paie = bool(re.match(r"^(paiement|psc|cb\s|carte\s)", lib, re.IGNORECASE))
+    if not est_vir and not est_paie:
+        return False
+    tronc = extraire_tronc(lib)
+    return not tronc or len(tronc) <= 3
+
+
+def cle_op(date_str: str, libelle: str) -> str:
+    """Clé unique d'une opération opaque : date|libellé normalisé."""
+    return f"{date_str}|{libelle.strip().upper()}"
+
+
+def memoriser_op(D, date_str: str, libelle: str, categorie: str):
+    """Mémorise la catégorie d'une opération opaque individuelle."""
+    if "ops_connues" not in D:
+        D["ops_connues"] = {}
+    D["ops_connues"][cle_op(date_str, libelle)] = categorie

@@ -17,12 +17,14 @@ def render(D, persist):
     with c1:
         st.markdown("**📥 Exporter**")
         backup = {
-            "version": 3,
+            "version": 4,
             "date": datetime.now().isoformat(),
             "tx": D["tx"], "cats": D["cats"], "prets": D["prets"],
             "rec": D["rec"], "sol": D["sol"], "overdraft": D["overdraft"],
             "budget_cible": D.get("budget_cible", {}),
             "revenu_cible": D.get("revenu_cible", {}),
+            "cat_keywords": D.get("cat_keywords", {}),
+            "ops_connues": D.get("ops_connues", {}),
         }
         st.download_button(
             "⬇️ Télécharger JSON",
@@ -68,7 +70,8 @@ def render(D, persist):
                     from modules.data import migrate
                     data_migrated = migrate(data_in)
                     for key in ["tx", "cats", "prets", "rec", "sol",
-                                "overdraft", "budget_cible", "revenu_cible"]:
+                                "overdraft", "budget_cible", "revenu_cible",
+                                "cat_keywords", "ops_connues"]:
                         if key in data_migrated:
                             D[key] = data_migrated[key]
                     persist()

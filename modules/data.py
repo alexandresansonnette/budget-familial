@@ -149,6 +149,11 @@ def migrate(data):
     if "overdraft" not in data:
         data["overdraft"] = {"ca": 500, "mc": 0, "mb": 250}
 
+    # v2.5 : registre de mots-clés appris pour la catégorisation
+    if "cat_keywords" not in data:
+        from modules.categorisation import SEED_KEYWORDS
+        data["cat_keywords"] = {k: list(v) for k, v in SEED_KEYWORDS.items()}
+
     return data
 
 

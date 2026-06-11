@@ -415,7 +415,7 @@ def _render_import_csv(D, persist):
         if is_releve_mc:
             c2.caption("💳 Prélèvement MC — déjà déduit par l'app, ne pas importer")
         # Catégorie proposée
-        proposed = _guess_cat(row["libelle"], cats)
+        proposed = _guess_cat(row["libelle"], cats, D)
         cat_sel = c3.selectbox(
             "Cat.",
             cats,
@@ -455,25 +455,16 @@ def _render_import_csv(D, persist):
         st.rerun()
 
 
-def _guess_cat(libelle, cats):
-    """Devine la catégorie depuis le libellé bancaire."""
-    lib = libelle.lower()
-    rules = [
-        (["salaire", "are ", "allocation", "caf ", "prime"], "ARE / Salaire"),
-        (["courses", "carrefour", "leclerc", "lidl", "aldi", "monop", "supermarché", "nourriture"], "Nourriture"),
-        (["loyer", "prêt", "credit", "crédit", "sgfgas", "caisse epargne", "regroupement"], "Prêt / Assurance"),
-        (["assurance", "groupama", "predica", "maaf", "axa"], "Prêt / Assurance"),
-        (["sncf", "ratp", "essence", "total", "bp ", "shell", "péage", "autoroute"], "Voiture"),
-        (["netflix", "spotify", "canal", "sfr", "free", "orange", "bouygues", "amazon prime", "apple", "google"], "Abonnement"),
-        (["pharmacie", "médecin", "docteur", "hopital", "clinique", "mutuelle"], "Santé"),
-        (["école", "scolaire", "cantine", "clae", "périscolaire"], "CLAE / École"),
-        (["sénégal", "senegal", "western union", "transfert"], "Sénégal"),
-        (["virement", "transfer"], "Virement interne"),
-        (["zara", "h&m", "primark", "coiffeur", "beauté"], "Habit / Beauté"),
-        (["restaurant", "cinéma", "loisir", "vacances", "voyage", "hotel"], "Loisirs / Vacances"),
-    ]
-    for keywords, cat in rules:
-        if any(kw in lib for kw in keywords):
-            if cat in cats:
-                return cat
+def _guess_cat(libelle, cats, D=None):
+    """
+    Devine la catégorie depuis le libellé bancaire.
+    v2.5 : utilise le registre APPRIS D['cat_keywords'] (persisté dans
+    Sheets, enrichi à chaque validation manuelle). Les anciennes règles
+    codées en dur servent d'amorçage via la migration.
+    """
+    if D is not None:
+        from modules.categorisation import guess_cat
+        cat = guess_cat(D, libelle, cats)
+        if cat and cat in cats:
+            return cat
     return cats[0] if cats else "Divers"

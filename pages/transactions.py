@@ -399,39 +399,96 @@ def _render_import_csv(D, persist):
         st.warning("Aucune ligne valide détectée.")
         return
 
-    # Tableau de validation
-    st.markdown(f"**{len(pending)} transactions à valider :**")
+    # ── v2.5 étape 2 : GROUPEMENT PAR LIBELLÉ + APPRENTISSAGE ────────────
+    # Un libellé = une validation (15 passages Leclerc → 1 seul choix).
+    # Libellé reconnu par le registre → catégorie pré-remplie.
+    # Libellé inconnu → choix + mot-clé (tronc pré-extrait) MÉMORISÉ
+    # dans D['cat_keywords'] à l'import → automatique la fois suivante.
+    from modules.categorisation import extraire_tronc, guess_cat, memoriser_mot_cle
+    from collections import defaultdict
+
+    groupes_lib = defaultdict(list)
+    for row in pending:
+        groupes_lib[row["libelle"]].append(row)
+
+    connus, inconnus, mc_releves = [], [], []
+    for lib, rows_g in groupes_lib.items():
+        if cpt_import == "ca" and _is_releve_mc(lib):
+            mc_releves.append((lib, rows_g))
+            continue
+        proposed = guess_cat(D, lib, cats)
+        if proposed and proposed in cats:
+            connus.append((lib, rows_g, proposed))
+        else:
+            inconnus.append((lib, rows_g))
+
+    n_tx_ok = sum(len(r) for _, r, _ in connus)
+    st.markdown(f"**{len(pending)} lignes → {len(groupes_lib)} libellés distincts** : "
+                f"{len(connus)} reconnus ({n_tx_ok} TX), "
+                f"{len(inconnus)} à catégoriser, "
+                f"{len(mc_releves)} prélèvement(s) MC ignoré(s).")
+    if mc_releves:
+        st.info("💳 Prélèvements Mastercard exclus (déjà déduits par l'app) : "
+                + " · ".join(lib[:35] for lib, _ in mc_releves))
+
     validated = []
-    n_mc_releve = 0
-    for i, row in enumerate(pending):
-        # GARDE-FOU v2.1 : prélèvement MC sur relevé CA → décoché par défaut
-        is_releve_mc = cpt_import == "ca" and _is_releve_mc(row["libelle"])
-        if is_releve_mc:
-            n_mc_releve += 1
+    a_memoriser = []  # [(cat, mot_cle)] à apprendre à l'import
 
-        c1, c2, c3, c4 = st.columns([2, 3, 2, 1])
-        c1.text(row["date"])
-        c2.text(row["libelle"][:40])
-        if is_releve_mc:
-            c2.caption("💳 Prélèvement MC — déjà déduit par l'app, ne pas importer")
-        # Catégorie proposée
-        proposed = _guess_cat(row["libelle"], cats, D)
-        cat_sel = c3.selectbox(
-            "Cat.",
-            cats,
-            index=cats.index(proposed) if proposed in cats else 0,
-            key=f"imp_cat_{i}",
-            label_visibility="collapsed"
-        )
-        incl = c4.checkbox("✓", value=not is_releve_mc, key=f"imp_incl_{i}")
-        if incl:
-            validated.append({**row, "categorie": cat_sel})
+    # ── Libellés INCONNUS : choix + mot-clé mémorisé ──────────────────────
+    if inconnus:
+        st.markdown("**🆕 À catégoriser (sera mémorisé) :**")
+        for gi, (lib, rows_g) in enumerate(sorted(inconnus)):
+            tot = sum(r["montant"] if r["type"] == "revenu" else -r["montant"]
+                      for r in rows_g)
+            with st.container(border=True):
+                c1, c2 = st.columns([3, 3])
+                with c1:
+                    st.write(f"**{lib[:45]}**")
+                    st.caption(f"{len(rows_g)} occurrence(s) · net {fmt2(tot)}")
+                with c2:
+                    cat_sel = st.selectbox(
+                        "Catégorie", ["— Choisir —"] + cats,
+                        key=f"imp_inc_cat_{gi}", label_visibility="collapsed")
+                    mot = st.text_input(
+                        "🔑 Mot-clé mémorisé", value=extraire_tronc(lib),
+                        key=f"imp_inc_mot_{gi}",
+                        help="Raccourcissez si besoin (ex : NETFLIX)")
+                incl = st.checkbox("Importer ces transactions", value=True,
+                                   key=f"imp_inc_ok_{gi}")
+                if incl and cat_sel != "— Choisir —":
+                    validated += [{**r, "categorie": cat_sel} for r in rows_g]
+                    if mot.strip():
+                        a_memoriser.append((cat_sel, mot))
+        non_choisis = sum(1 for gi, (lib, _) in enumerate(sorted(inconnus))
+                          if st.session_state.get(f"imp_inc_cat_{gi}",
+                                                  "— Choisir —") == "— Choisir —"
+                          and st.session_state.get(f"imp_inc_ok_{gi}", True))
+        if non_choisis:
+            st.warning(f"⚠️ {non_choisis} libellé(s) sans catégorie — "
+                       f"ils ne seront pas importés.")
 
-    if n_mc_releve:
-        st.info(f"💳 {n_mc_releve} ligne(s) de prélèvement Mastercard détectée(s) "
-                f"et décochée(s) automatiquement.")
+    # ── Libellés RECONNUS : compact, modifiable ───────────────────────────
+    if connus:
+        with st.expander(f"✅ Reconnus automatiquement ({len(connus)} libellés) "
+                         f"— vérifier / ajuster", expanded=False):
+            for gi, (lib, rows_g, proposed) in enumerate(sorted(connus)):
+                c1, c2, c3 = st.columns([3, 2, 1])
+                tot = sum(r["montant"] if r["type"] == "revenu" else -r["montant"]
+                          for r in rows_g)
+                c1.write(f"{lib[:40]}")
+                c1.caption(f"{len(rows_g)} TX · net {fmt2(tot)}")
+                cat_sel = c2.selectbox(
+                    "Cat.", cats, index=cats.index(proposed),
+                    key=f"imp_con_cat_{gi}", label_visibility="collapsed")
+                incl = c3.checkbox("✓", value=True, key=f"imp_con_ok_{gi}")
+                if incl:
+                    validated += [{**r, "categorie": cat_sel} for r in rows_g]
+                    # Correction d'un reconnu = ré-apprentissage
+                    if cat_sel != proposed:
+                        a_memoriser.append((cat_sel, extraire_tronc(lib)))
 
-    if st.button(f"✅ Importer {len(validated)} transactions", type="primary"):
+    if st.button(f"✅ Importer {len(validated)} transactions", type="primary",
+                 disabled=not validated):
         added = 0
         for row in validated:
             aff_m, aff_y = (None, None)
@@ -450,8 +507,13 @@ def _render_import_csv(D, persist):
                 "affY": aff_y,
             })
             added += 1
+        n_appris = sum(1 for cat, mot in a_memoriser
+                       if memoriser_mot_cle(D, cat, mot))
         persist()
-        st.success(f"✓ {added} transactions importées.")
+        msg = f"✓ {added} transactions importées."
+        if n_appris:
+            msg += f" 🧠 {n_appris} mot(s)-clé(s) mémorisé(s)."
+        st.success(msg)
         st.rerun()
 
 

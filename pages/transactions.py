@@ -424,6 +424,68 @@ def _render_import_csv(D, persist):
         st.warning("Aucune ligne valide détectée.")
         return
 
+    # ══ v2.7 (B+C) : RAPPROCHEMENT BANCAIRE ═══════════════════════════════
+    # Compare le relevé aux TX déjà saisies (même compte, même montant,
+    # date exacte ou ±3 j pour les décalages date valeur/opération).
+    certains, probables, pending, tx_absentes = _rapprocher_releve(
+        pending, D, cpt_import)
+    doublons_forces = []
+
+    n_anomalies = len(probables) + len(tx_absentes)
+    with st.expander(
+        f"🔍 Rapprochement bancaire — {len(certains)} déjà saisie(s), "
+        f"{len(probables)} probable(s), {len(tx_absentes)} TX appli "
+        f"absente(s) du relevé",
+        expanded=n_anomalies > 0
+    ):
+        # ⛔ Doublons certains : exclus d'office
+        if certains:
+            st.markdown("**⛔ Déjà présentes dans l'appli (montant + date "
+                        "identiques) — exclues d'office :**")
+            for di, (row, t, _) in enumerate(certains):
+                c1, c2 = st.columns([4, 1])
+                c1.caption(
+                    f"{row['date']} · {row['libelle'][:35]} · "
+                    f"{fmt2(row['montant'])} ↔ déjà saisi : "
+                    f"« {t.get('note') or t['categorie']} » ({t['categorie']})")
+                if c2.checkbox("Forcer", value=False, key=f"rap_force_{di}",
+                               help="Importer quand même (vraie double dépense)"):
+                    doublons_forces.append({**row, "categorie": t["categorie"]})
+
+        # ⚠️ Doublons probables : à trancher
+        if probables:
+            st.markdown("**⚠️ Doublons probables (même montant, ±3 jours) — "
+                        "décochés par défaut :**")
+            for pi, (row, t, delta) in enumerate(probables):
+                c1, c2 = st.columns([4, 1])
+                c1.caption(
+                    f"{row['date']} · {row['libelle'][:35]} · "
+                    f"{fmt2(row['montant'])} ↔ "
+                    f"« {t.get('note') or t['categorie']} » du {t['date']} "
+                    f"(écart {delta} j)")
+                if c2.checkbox("Importer", value=False, key=f"rap_prob_{pi}",
+                               help="Cochez si ce sont bien 2 opérations distinctes"):
+                    doublons_forces.append({**row, "categorie": t["categorie"]})
+
+        # 🔎 TX de l'appli absentes du relevé : incohérence à vérifier
+        if tx_absentes:
+            st.markdown("**🔎 Saisies dans l'appli mais ABSENTES du relevé** "
+                        "— montant ou date erronés ? mauvais compte ?")
+            for t in sorted(tx_absentes, key=lambda x: x["date"]):
+                sign = "+" if t["type"] == "revenu" else "−"
+                st.caption(f"{t['date']} · {t.get('note') or t['categorie']} · "
+                           f"{sign}{fmt2(t['montant'])} ({t['categorie']})")
+            st.info("💡 Ouvrez ces TX dans la liste pour corriger montant/"
+                    "date/compte — c'est la clé de la cohérence relevé ↔ appli.")
+
+        if not certains and not probables and not tx_absentes:
+            st.success("✓ Relevé et appli parfaitement cohérents sur la période.")
+
+    if not pending and not doublons_forces:
+        st.success("✓ Toutes les lignes du relevé sont déjà dans l'appli — "
+                   "rien à importer.")
+        return
+
     # ── v2.5 étape 2 : GROUPEMENT PAR LIBELLÉ + APPRENTISSAGE ────────────
     # Un libellé = une validation (15 passages Leclerc → 1 seul choix).
     # Libellé reconnu par le registre → catégorie pré-remplie.
@@ -463,7 +525,7 @@ def _render_import_csv(D, persist):
         st.info("💳 Prélèvements Mastercard exclus (déjà déduits par l'app) : "
                 + " · ".join(lib[:35] for lib, _ in mc_releves))
 
-    validated = []
+    validated = list(doublons_forces)  # doublons forcés au rapprochement
     a_memoriser = []      # [(cat, mot_cle)] → registre de mots-clés
     a_memoriser_ops = []  # [(date, libelle, cat)] → ops_connues
 
@@ -594,3 +656,66 @@ def _guess_cat(libelle, cats, D=None):
         if cat and cat in cats:
             return cat
     return cats[0] if cats else "Divers"
+
+
+# ══ v2.7 (B+C) : Rapprochement bancaire ═════════════════════════════════════
+def _rapprocher_releve(pending, D, cpt_import):
+    """
+    Rapproche les lignes du relevé des TX déjà saisies sur le même compte.
+    Matching : même type + même montant (au centime) + écart de date :
+      0 jour  → doublon CERTAIN (exclu d'office)
+      ≤ 3 j   → doublon PROBABLE (date valeur vs date opération)
+    Chaque TX existante ne peut matcher qu'UNE ligne du relevé
+    (affectation gloutonne par écart croissant).
+
+    Retourne (certains, probables, restants, tx_absentes) :
+      certains/probables : [(ligne_releve, tx_existante, delta_jours)]
+      restants           : lignes du relevé sans correspondance → import normal
+      tx_absentes        : TX de l'appli sur la période, absentes du relevé
+                           → incohérence à vérifier (rapprochement bancaire)
+    """
+    from datetime import timedelta
+    if not pending:
+        return [], [], pending, []
+
+    dates_rel = [datetime.strptime(r["date"], "%Y-%m-%d") for r in pending]
+    dmin = min(dates_rel) - timedelta(days=3)
+    dmax = max(dates_rel) + timedelta(days=3)
+
+    exist = []
+    for t in D["tx"]:
+        if t["compte"] != cpt_import:
+            continue
+        dt = datetime.strptime(t["date"], "%Y-%m-%d")
+        if dmin <= dt <= dmax:
+            exist.append(t)
+
+    # Paires candidates triées par écart de date croissant
+    paires = []
+    for i, r in enumerate(pending):
+        dr = datetime.strptime(r["date"], "%Y-%m-%d")
+        for t in exist:
+            if t["type"] != r["type"]:
+                continue
+            if abs(float(t["montant"]) - float(r["montant"])) > 0.005:
+                continue
+            delta = abs((datetime.strptime(t["date"], "%Y-%m-%d") - dr).days)
+            if delta <= 3:
+                paires.append((delta, i, t["id"], t))
+    paires.sort(key=lambda p: p[0])
+
+    used_rel, used_tx = set(), set()
+    certains, probables = [], []
+    for delta, i, tid, t in paires:
+        if i in used_rel or tid in used_tx:
+            continue
+        used_rel.add(i)
+        used_tx.add(tid)
+        if delta == 0:
+            certains.append((pending[i], t, delta))
+        else:
+            probables.append((pending[i], t, delta))
+
+    restants = [r for i, r in enumerate(pending) if i not in used_rel]
+    tx_absentes = [t for t in exist if t["id"] not in used_tx]
+    return certains, probables, restants, tx_absentes

@@ -17,7 +17,7 @@ from collections import defaultdict
 from modules.data import CATS_NEUTRES, CATS_REVENUS
 from modules.calculs import (
     aff_key, month_add, resolve_sol, mc_depenses_mois, get_sol,
-    solde_bancaire, projection_fin_mois, _mvt_net
+    solde_bancaire, projection_fin_mois, _mvt_net, rec_active
 )
 
 

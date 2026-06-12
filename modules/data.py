@@ -30,17 +30,21 @@ CATS_DEFAULT = sorted([
     "Épargne", "Virement interne", "Impôts / Taxes", "Divers",
 ])
 
+# Valeurs d'exemple génériques — les vraies cibles de l'utilisateur vivent
+# dans le stockage (Google Sheets) et sont modifiables dans l'app
+# (Prévisionnel → Budget cible). Ces défauts ne servent qu'au tout premier
+# démarrage sur des données vierges.
 BUDGET_CIBLE_DEFAULT = {
     "ca": {
-        "Nourriture": 108, "Frais divers": 170, "Habit / Beauté": 19,
-        "Loisirs / Vacances": 621, "CLAE / École": 1, "Voiture": 0,
-        "Abonnement": 0, "Santé": 48, "Sénégal": 0, "Divers": 500,
+        "Nourriture": 200, "Frais divers": 100, "Habit / Beauté": 50,
+        "Loisirs / Vacances": 150, "CLAE / École": 0, "Voiture": 100,
+        "Abonnement": 50, "Santé": 50, "Sénégal": 0, "Divers": 100,
     },
     "mb": {
-        "Nourriture": 319, "Frais divers": 40, "Habit / Beauté": 65,
-        "Loisirs / Vacances": 266, "CLAE / École": 339, "Voiture": 130,
-        "Abonnement": 0, "Santé": 66, "Sénégal": 218, "Divers": 400,
-        "Prêt / Assurance": 335,
+        "Nourriture": 300, "Frais divers": 100, "Habit / Beauté": 50,
+        "Loisirs / Vacances": 150, "CLAE / École": 100, "Voiture": 100,
+        "Abonnement": 50, "Santé": 50, "Sénégal": 0, "Divers": 100,
+        "Prêt / Assurance": 0,
     },
 }
 
